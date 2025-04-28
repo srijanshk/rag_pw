@@ -1,0 +1,9 @@
+name: srijan_pw_env
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - matplotlib
+  - numpy
+  - pandas
+prefix: /system/apps/studentenv/shakya/srijan_pw_env

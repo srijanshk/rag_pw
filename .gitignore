@@ -1,0 +1,36 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VSCode settings (if any)
+.vscode/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Checkpoints, downloads, and model outputs
+checkpoints/
+downloads/
+mpnet/
+wikipedia_faiss_index
+wikipedia_metadata.jsonl
+stage1_predictions_epoch1.json
+training_loss.png
+f1_score.png
+f1_score_dense.png
+EM_score.png
+
+
+# Other temporary files
+*.log
+*.tmp
