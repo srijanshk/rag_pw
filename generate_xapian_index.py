@@ -8,8 +8,8 @@ from tqdm import tqdm
 
 # --- Configuration ---
 CONFIG = {
-    "chunk_dir": "processed_chunks",  # already-chunked .jsonl files
-    "xapian_db_path": "wikipedia_xapian_db",
+    "tsv_file": "downloads/data/wikipedia_split/psgs_w100.tsv",
+    "xapian_db_path": "/local00/student/shakya/wikipedia_xapian_db",
 }
 
 logging.basicConfig(
@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Global shared variable for worker processes
 global_worker_queue = None
+
+def collect_chunk_files():
+    return [CONFIG["tsv_file"]]
 
 def pool_worker_init(queue):
     global global_worker_queue
@@ -60,6 +63,8 @@ def writer_process(queue):
 
             db.add_document(doc)
             count += 1
+            if count % 10000 == 0:
+                print(f"📄 Indexed {count} documents...")
         except Exception as e:
             logger.warning(f"Writer failed to process one chunk: {e}")
 
@@ -67,31 +72,28 @@ def writer_process(queue):
     logger.info(f"Writer process finished. Indexed {count} documents.")
 
 def process_file(file_path):
-    """
-    Worker function to read each chunk in a pre-chunked .jsonl file
-    and send it to the writer queue.
-    """
     global global_worker_queue
     try:
+        import csv
+        from tqdm import tqdm
+        import os
         with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    chunk = json.loads(line)
-                    if isinstance(chunk, dict) and "id" in chunk and "title" in chunk and "text" in chunk:
-                        global_worker_queue.put(chunk)
-                except json.JSONDecodeError:
-                    logger.warning(f"Skipping invalid JSON in {file_path}")
+            total_lines = sum(1 for _ in open(file_path, "r", encoding="utf-8")) - 1
+            f.seek(0)
+            reader = csv.DictReader(f, delimiter="\t", fieldnames=["id", "text", "title"])
+            next(reader)
+            for row in tqdm(reader, total=total_lines, desc=f"Processing {os.path.basename(file_path)}"):
+                if row["text"].strip():
+                    chunk = {
+                        "id": str(row["id"]),
+                        "title": row["title"],
+                        "text": row["text"]
+                    }
+                    global_worker_queue.put(chunk)
     except Exception as e:
         logger.error(f"Failed to process file {file_path}: {e}")
     return file_path
 
-def collect_chunk_files():
-    chunk_files = []
-    for root, _, files in os.walk(CONFIG["chunk_dir"]):
-        for file in files:
-            if file.endswith(".jsonl") or file.endswith(".json"):
-                chunk_files.append(os.path.join(root, file))
-    return chunk_files
 
 def main():
     logger.info("Starting Xapian indexing...")
@@ -106,8 +108,7 @@ def main():
 
     pool = Pool(processes=cpu_count(), initializer=pool_worker_init, initargs=(queue,))
     try:
-        for _ in tqdm(pool.imap_unordered(process_file, chunk_files),
-                      total=len(chunk_files), desc="Indexing"):
+        for _ in tqdm(pool.imap_unordered(process_file, chunk_files), desc="Indexing"):
             pass
     finally:
         pool.close()
