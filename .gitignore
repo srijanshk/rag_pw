@@ -19,9 +19,10 @@ env/
 Thumbs.db
 
 # Checkpoints, downloads, and model outputs
-checkpoints/
-downloads/
-mpnet/
+checkpoints/*
+downloads/*
+models/*
+mpnet/*
 wikipedia_faiss_index
 wikipedia_metadata.jsonl
 stage1_predictions_epoch1.json
@@ -34,3 +35,4 @@ EM_score.png
 # Other temporary files
 *.log
 *.tmp
+wandb/
