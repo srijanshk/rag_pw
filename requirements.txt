@@ -3,24 +3,29 @@ aiohappyeyeballs @ file:///croot/aiohappyeyeballs_1734469393482/work
 aiohttp @ file:///croot/aiohttp_1734687138658/work
 aiosignal @ file:///tmp/build/80754af9/aiosignal_1637843061372/work
 alabaster==1.0.0
+annotated-types==0.7.0
 attrs @ file:///croot/attrs_1734533101012/work
 babel==2.17.0
+bert-score==0.3.13
 Bottleneck @ file:///croot/bottleneck_1731058641041/work
 Brotli @ file:///croot/brotli-split_1736182456865/work
-certifi @ file:///home/conda/feedstock_root/build_artifacts/certifi_1739515848642/work/certifi
+certifi @ file:///croot/certifi_1738623731865/work/certifi
 charset-normalizer @ file:///croot/charset-normalizer_1721748349566/work
 click==8.1.8
 contourpy @ file:///croot/contourpy_1732540045555/work
 cycler @ file:///tmp/build/80754af9/cycler_1637851556182/work
 datasets==3.5.0
 dill @ file:///croot/dill_1715094664823/work
+docker-pycreds==0.4.0
 docutils==0.21.2
 faiss-cpu==1.10.0
 filelock @ file:///work/perseverance-python-buildout/croot/filelock_1701733993137/work
 fonttools @ file:///croot/fonttools_1737039080035/work
 frozenlist @ file:///croot/frozenlist_1730902802621/work
 fsspec==2024.6.1
-huggingface_hub==0.29.2
+gitdb==4.0.12
+GitPython==3.1.44
+huggingface-hub==0.29.3
 idna==3.10
 imagesize==1.4.1
 Jinja2==3.1.4
@@ -53,9 +58,13 @@ nvidia-nvtx-cu12==12.1.105
 packaging @ file:///croot/packaging_1734472117206/work
 pandas @ file:///croot/pandas_1732735089971/work/dist/pandas-2.2.3-cp312-cp312-linux_x86_64.whl#sha256=57b66702d418720ec8483f7c4ec7c08d41815316ad7ce09d5b7bbc34eefcfdfd
 pillow @ file:///croot/pillow_1738010226202/work
+platformdirs==4.3.7
 propcache @ file:///croot/propcache_1732303986938/work
+protobuf==6.30.2
 psutil==7.0.0
 pyarrow @ file:///croot/pyarrow_1738229418212/work/python
+pydantic==2.11.4
+pydantic_core==2.33.2
 Pygments==2.19.1
 pyparsing @ file:///croot/pyparsing_1731445506121/work
 PyQt6==6.7.1
@@ -73,9 +82,12 @@ scikit-learn==1.6.1
 scipy==1.15.2
 sentence-transformers==4.0.1
 sentencepiece==0.2.0
+sentry-sdk==2.27.0
+setproctitle==1.3.6
 setuptools==72.1.0
 sip @ file:///croot/sip_1738856193618/work
 six @ file:///tmp/build/80754af9/six_1644875935023/work
+smmap==5.0.2
 snowballstemmer==2.2.0
 Sphinx==8.2.3
 sphinxcontrib-applehelp==2.0.0
@@ -93,10 +105,12 @@ tornado @ file:///croot/tornado_1733960490606/work
 tqdm @ file:///croot/tqdm_1738943501192/work
 transformers==4.50.3
 triton==3.1.0
+typing-inspection==0.4.0
 typing_extensions @ file:///croot/typing_extensions_1734714854207/work
 tzdata @ file:///croot/python-tzdata_1690578112552/work
 unicodedata2 @ file:///croot/unicodedata2_1736541023050/work
 urllib3 @ file:///croot/urllib3_1737133630106/work
+wandb==0.19.10
 wget==3.2
 wheel==0.45.1
 xxhash @ file:///croot/python-xxhash_1737039434400/work
