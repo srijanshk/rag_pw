@@ -1,6 +1,7 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "4" # Or your desired GPU
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True" # If needed
+from typing import List
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,2,3" 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import json
 import matplotlib.pyplot as plt
@@ -11,20 +12,23 @@ import wandb
 
 from retriever import DenseRetriever
 from pipeline import RAGPipeline
-from evaluate import evaluate_pipeline # From your evaluate.py
+from evaluate import evaluate_pipeline
 
 CHECKPOINTS_DIR = "checkpoints"
-BEST_MODEL_DIR_STAGE3 = os.path.join(CHECKPOINTS_DIR, "best_model_stage3")
+BEST_E2E_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "best_model_single_stage_e2e")
 FINAL_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "final_model_E2E")
 
 os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-os.makedirs(BEST_MODEL_DIR_STAGE3, exist_ok=True)
-os.makedirs(FINAL_MODEL_DIR, exist_ok=True)
+os.makedirs(BEST_E2E_MODEL_DIR, exist_ok=True)
 
 TRAIN_FILE = "downloads/data/retriever/nq-train.json"
 TEST_FILE = "downloads/data/retriever/nq-dev.json"
-FAISS_INDEX_PATH = "wikipedia_faiss_index" 
-METADATA_PATH = "wikipedia_metadata.jsonl"
+FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_hnsw_index" 
+METADATA_PATH = "/local00/student/shakya/wikipedia_metadata.jsonl"
+
+MAX_EPOCHS_E2E = 10      
+PATIENCE_EPOCHS_E2E = 3   
+SUBSET_EVAL_SIZE = 1500 
 
 
 def load_dpr_json(path):
@@ -47,64 +51,86 @@ def load_dpr_json(path):
 
         if not query or not pos_ctxs:
             continue
-        
-        pos_ctxs_sorted = sorted(pos_ctxs, key=lambda x: x.get("score", 0), reverse=True)
-        top_pos = pos_ctxs_sorted[0]
-        top_text = top_pos.get("text", "")
 
-        if not top_text: 
+        pos_ctxs_sorted = sorted(pos_ctxs, key=lambda x: x.get("score", 0), reverse=True)
+        positive_texts = [ctx.get("text", "") for ctx in pos_ctxs_sorted[:2] if ctx.get("text", "")]
+        if not positive_texts:
             continue
 
-        weak_positives_as_negs = [
-            ctx.get("text", "") for ctx in pos_ctxs_sorted[-2:]
-            if ctx.get("text", "") and ctx.get("text", "") != top_text
-        ]
-        hard_negs = [ctx.get("text", "") for ctx in hard_neg_ctxs[:2] if ctx.get("text", "")]
-        combined_negs = [neg for neg in (weak_positives_as_negs + hard_negs) if neg]
+        hard_negs = [ctx.get("text", "") for ctx in hard_neg_ctxs[:3] if ctx.get("text", "")]
 
         processed.append({
             "query": query,
-            "positive_docs": [top_text], 
-            "negative_docs": combined_negs, 
+            "positive_docs": positive_texts,
+            "negative_docs": hard_negs,
             "answers": answers
         })
     return processed
 
+def compute_answer_recall(rag_pipeline: RAGPipeline,
+                          dataset: List[dict],
+                          k: int) -> float:
+    """
+    Returns “Answer Recall@k”: the percentage of queries in the dataset
+    for which at least one of the top-k retrieved passages
+    contains the gold answer text.
+    """
+    hits = 0
+    for item in tqdm(dataset, desc=f"Answer‐Recall@{k} eval", leave=False):
+        query = item["query"]
+        gold_answers = item["answers"]
+
+        # Retrieve top-k docs via FAISS
+        retrieved = rag_pipeline.dense_retriever.search(query, k)
+        texts = [r["text"].lower() for r in retrieved]
+
+        # Check if any retrieved doc contains any of the gold answers
+        found = False
+        for ans in gold_answers:
+            ans_norm = ans.strip().lower()
+            if not ans_norm:
+                continue
+            if any(ans_norm in doc_text for doc_text in texts):
+                found = True
+                break
+
+        if found:
+            hits += 1
+
+    return hits / len(dataset) * 100.0
+
+
 def main():
-    batch_size_retriever_ft = 8
-    batch_size_rag = 16
-    
-    stage1_epochs = 0
-    stage2_epochs = 2
-    stage3_epochs = 6
+    batch_size_rag = 8
 
-    retriever_model_name = "intfloat/e5-large-v2"
-    generator_model_name = "facebook/bart-base"
-    
-    retriever_lr_config = 2e-5 
-    generator_lr_config = 3e-5 
-    
-    top_k_retrieval = 50
 
+    retriever_model_name = "models/retriever_finetuned_e5_best"
+    generator_model_name = "best_bart_model"
+
+    # Load passage ID→row map to determine number of passages for memmap
+    with open("/local00/student/shakya/id2row.json", "r", encoding="utf-8") as f:
+        id2row_map = json.load(f)
+    num_passages = len(id2row_map)
+
+    top_k_retrieval = 10
+
+    run_name = f"RAG_SingleStage_E2E_{MAX_EPOCHS_E2E}maxEp_P{PATIENCE_EPOCHS_E2E}"
     wandb.init(
-        project="rag-qa-e2e", 
-        name="RAG_E2E_With_Stages_v3_Fix", # Changed name to reflect fix
+        project="rag-qa-e2e-simplified", # New project or same, adjust as needed
+        name=run_name,
         config={
-            "batch_size_retriever_ft": batch_size_retriever_ft,
-            "batch_size_rag": batch_size_rag,
-            "stage1_epochs": stage1_epochs,
-            "stage2_epochs": stage2_epochs,
-            "stage3_epochs": stage3_epochs,
-            "retriever_model": retriever_model_name,
-            "generator_model": generator_model_name,
+            "batch_size_rag_e2e": batch_size_rag,
+            "max_epochs_e2e": MAX_EPOCHS_E2E,
+            "patience_e2e": PATIENCE_EPOCHS_E2E,
+            "initial_retriever_model": retriever_model_name,
+            "initial_generator_model": generator_model_name,
             "optimizer": "AdamW",
-            "retriever_lr_config": retriever_lr_config,
-            "generator_lr_config": generator_lr_config,
             "top_k_retrieval_inference": top_k_retrieval,
             "faiss_index_path": FAISS_INDEX_PATH,
             "metadata_path": METADATA_PATH,
+            "subset_eval_size": SUBSET_EVAL_SIZE,
         },
-        notes="Three-stage fine-tuning: retriever (optional), generator, end-to-end RAG. Corrected wandb.watch.",
+        notes="Single-stage end-to-end RAG fine-tuning with early stopping based on subset evaluation.",
         resume="allow", id=wandb.util.generate_id()
     )
 
@@ -114,245 +140,205 @@ def main():
     print("Loading training data...")
     train_data = load_dpr_json(TRAIN_FILE)
     print("Loading test data...")
-    test_data = load_dpr_json(TEST_FILE)
-    
+    full_test_data = load_dpr_json(TEST_FILE)
+
+    subset_test_data_for_epochs = []
+    if full_test_data:
+        if len(full_test_data) > SUBSET_EVAL_SIZE:
+            subset_test_data_for_epochs = full_test_data[:SUBSET_EVAL_SIZE] # Simple slice
+            print(f"Created subset of {len(subset_test_data_for_epochs)} samples for inter-epoch evaluation.")
+        else:
+            subset_test_data_for_epochs = full_test_data
+            print(f"Using all {len(subset_test_data_for_epochs)} test samples for inter-epoch evaluation (full set smaller than subset size).")
+    else:
+        print("No full test data loaded. Inter-epoch and final evaluations will be skipped.")
+
     if not train_data:
         print("No training data loaded. Exiting.")
-        wandb.finish()
+        if wandb.run: wandb.finish()
         return
-    if not test_data:
-        print("No test data loaded. Evaluation will be skipped if Stage 3 runs.")
 
-    print(f"Loaded {len(train_data)} training samples and {len(test_data)} test samples.")
+    print(f"Loaded {len(train_data)} training samples and {len(full_test_data)} full test samples.")
 
-    retriever_path_stage1 = os.path.join(CHECKPOINTS_DIR, "retriever_stage1_query_encoder")
-    
-    if stage1_epochs > 0:
-        print("\n🔹 Stage 1: Retriever Fine-tuning (Standalone)")
-        retriever_stage1 = DenseRetriever(
-            index_path=FAISS_INDEX_PATH,
-            metadata_path=METADATA_PATH,
-            device=device,
-            model_name=retriever_model_name,
-            fine_tune_flag=True
-        )
-        if hasattr(retriever_stage1, 'query_encoder'):
-             wandb.watch(retriever_stage1.query_encoder, log="all", log_freq=100) # Removed 'name'
 
-        retriever_train_data_formatted = [
-            {
-                "query": item["query"],
-                "positive_doc": item["positive_docs"][0] if item["positive_docs"] else None,
-                "negative_docs": item.get("negative_docs", [])
-            }
-            for item in train_data if item.get("positive_docs")
-        ]
-        if not retriever_train_data_formatted:
-            print("Warning: No data suitable for retriever fine-tuning (Stage 1) after formatting.")
-        else:
-            print(f"Starting Stage 1 training with {len(retriever_train_data_formatted)} formatted samples.")
-            for epoch in range(stage1_epochs):
-                print(f"\nRetriever Standalone Epoch {epoch+1}/{stage1_epochs}")
-                np.random.shuffle(retriever_train_data_formatted)
-                num_batches = (len(retriever_train_data_formatted) + batch_size_retriever_ft - 1) // batch_size_retriever_ft
-                batch_indices = range(0, len(retriever_train_data_formatted), batch_size_retriever_ft)
-                with tqdm(total=len(batch_indices), desc=f"Retriever FT Epoch {epoch+1}") as pbar:
-                    for i_idx, i_start in enumerate(batch_indices):
-                        batch = retriever_train_data_formatted[i_start : i_start + batch_size_retriever_ft]
-                        if not batch: continue
-                        loss = retriever_stage1.fine_tune_on_batch(batch)
-                        pbar.update(1)
-                        if loss is not None:
-                            wandb.log({"retriever_standalone_loss": loss, 
-                                       "stage1_epoch": epoch+1, 
-                                       "stage1_batch_idx": i_idx})
-            retriever_stage1.save_query_encoder(retriever_path_stage1)
-            print(f"Retriever fine-tuning (Stage 1) complete. Saved to {retriever_path_stage1}")
-            retriever = DenseRetriever.load_from_paths(
-                model_load_path=retriever_path_stage1,
-                index_path=FAISS_INDEX_PATH,
-                metadata_path=METADATA_PATH,
-                device=device,
-                base_model_name_for_doc_encoder=retriever_model_name
-            )
-    else:
-        print("\nSkipping Stage 1: Retriever Fine-tuning (Standalone)")
-        if os.path.exists(retriever_path_stage1) and os.listdir(retriever_path_stage1): # Check if dir exists and is not empty
-            print(f"Loading retriever from pre-trained Stage 1 checkpoint: {retriever_path_stage1}")
-            retriever = DenseRetriever.load_from_paths(
-                model_load_path=retriever_path_stage1,
-                index_path=FAISS_INDEX_PATH,
-                metadata_path=METADATA_PATH,
-                device=device,
-                base_model_name_for_doc_encoder=retriever_model_name
-            )
-        else:
-            print(f"Initializing fresh retriever for subsequent stages (no Stage 1 checkpoint at {retriever_path_stage1}).")
-            retriever = DenseRetriever(
-                index_path=FAISS_INDEX_PATH,
-                metadata_path=METADATA_PATH,
-                device=device,
-                model_name=retriever_model_name,
-                fine_tune_flag=False
-            )
 
-    # --- Stage 2: Generator-only fine-tuning ---
-    generator_path_stage2 = os.path.join(CHECKPOINTS_DIR, "generator_stage2")
+    print(f"\n🚀 Initializing Retriever with: {retriever_model_name}")
+    retriever = DenseRetriever(
+        index_path=FAISS_INDEX_PATH,
+        metadata_path=METADATA_PATH,
+        device=device,
+        model_name=retriever_model_name,
+        passage_tokenizer_name_or_path=generator_model_name,
+        id2row_path="/local00/student/shakya/id2row.json",
+        input_ids_path="/local00/student/shakya/passage_input_ids.dat",
+        attention_mask_path="/local00/student/shakya/passage_attention_mask.dat",
+        num_passages=num_passages,
+        passage_max_len=512,
+        fine_tune=False,
+        ef_search=1500,
+        ef_construction=200,
+    )
+    print(f"\n🚀 Initializing RAG Pipeline with Generator: {generator_model_name}")
+    steps_per_epoch = (len(train_data) + batch_size_rag - 1) // batch_size_rag
+    total_scheduler_steps = steps_per_epoch * MAX_EPOCHS_E2E
+
     rag_pipeline_instance = RAGPipeline(
-            dense_retriever=retriever,
-            device=device,
-            train_generator=False, 
-            train_retriever_end_to_end=False, 
-            total_steps_for_scheduler=1, # Placeholder
-            k_retrieval_for_inference=top_k_retrieval
+        model_name=generator_model_name,
+        dense_retriever=retriever,
+        device=device,
+        train_generator=True,             
+        train_retriever_end_to_end=True,
+        total_steps_for_scheduler=total_scheduler_steps,
+        k_retrieval_for_inference=top_k_retrieval,
+        retriever_temperature_for_training=1.0
+    )
+
+    # --- Single Training Loop with Early Stopping ---
+    avg_losses_per_epoch_e2e = []
+    subset_eval_scores_e2e = []
+    best_f1_on_subset_e2e = 0.0
+    patience_counter_e2e = 0
+
+    for epoch in range(MAX_EPOCHS_E2E):
+        print(f"\n--- Training Epoch {epoch+1}/{MAX_EPOCHS_E2E} (End-to-End) ---")
+
+        # RAGPipeline.train_pipeline internally loops for the number of epochs it's given.
+        epoch_avg_loss_list = rag_pipeline_instance.train_pipeline(
+            dataset=train_data,
+            batch_size=batch_size_rag,
+            epochs=1,
+            stage_name=f"E2E_Train_Epoch{epoch+1}"
         )
+        if epoch_avg_loss_list:
+            avg_losses_per_epoch_e2e.append(epoch_avg_loss_list[0])
 
-    if stage2_epochs > 0:
-        print("\n🔄 Stage 2: Generator-only fine-tuning")
-        retriever.disable_fine_tuning_mode()
-        
-        steps_for_stage2 = (len(train_data) + batch_size_rag - 1) // batch_size_rag * stage2_epochs
-        rag_pipeline_instance = RAGPipeline( # Overwrite previous placeholder instance
-            dense_retriever=retriever,
-            device=device,
-            train_generator=True,
-            train_retriever_end_to_end=False,
-            total_steps_for_scheduler=steps_for_stage2,
-            k_retrieval_for_inference=top_k_retrieval,
-            retriever_temperature_for_training=1.0
-        )
-        wandb.watch(rag_pipeline_instance.generator, log="all", log_freq=100) # Removed 'name'
+        current_epoch_subset_f1 = 0.0
+        if subset_test_data_for_epochs:
+            rag_pipeline_instance.generator.eval()
+            if hasattr(rag_pipeline_instance.dense_retriever, 'query_encoder'):
+                rag_pipeline_instance.dense_retriever.query_encoder.eval()
 
-        print("RAG pipeline initialized for Stage 2 (Generator Only).")
-        rag_pipeline_instance.train_pipeline(
-            train_data, 
-            batch_size=batch_size_rag, 
-            epochs=stage2_epochs, 
-            stage_name="Stage2_GeneratorOnly"
-        )
-        rag_pipeline_instance.generator.save_pretrained(generator_path_stage2)
-        rag_pipeline_instance.tokenizer.save_pretrained(generator_path_stage2)
-        print(f"Generator fine-tuning (Stage 2) complete. Saved to {generator_path_stage2}")
-
-
-    # --- Stage 3: End-to-End RAG Fine-tuning ---
-    all_stage3_losses = []
-    eval_scores_stage3 = []
-    best_f1_stage3 = 0.0
-
-    if stage3_epochs > 0:
-        print("\n🔄 Stage 3: End-to-End RAG fine-tuning")
-        
-        rag_pipeline_instance.train_generator = True # Ensure generator is trained
-        rag_pipeline_instance.train_retriever_end_to_end = True # Enable E2E retriever training
-        
-        steps_for_stage3 = (len(train_data) + batch_size_rag - 1) // batch_size_rag * stage3_epochs
-        rag_pipeline_instance._init_optimizers_and_scheduler( # Re-initialize optimizer and scheduler for E2E
-            num_training_steps_for_current_stage=steps_for_stage3
-        ) 
-
-        wandb.watch(rag_pipeline_instance.generator, log="all", log_freq=100) # Removed 'name'
-        if hasattr(rag_pipeline_instance.dense_retriever, 'query_encoder'):
-             wandb.watch(rag_pipeline_instance.dense_retriever.query_encoder, log="all", log_freq=100) # Removed 'name'
-
-        print("RAG pipeline re-configured for Stage 3 (End-to-End).")
-        
-        for epoch in range(stage3_epochs):
-            print(f"\nStage 3 Epoch {epoch+1}/{stage3_epochs} (End-to-End)")
-            epoch_loss_list = rag_pipeline_instance.train_pipeline(
-                train_data, 
-                batch_size=batch_size_rag, 
-                epochs=1, 
-                stage_name=f"Stage3_E2E_Epoch{epoch+1}"
+            print(f"Evaluating on SUBSET ({len(subset_test_data_for_epochs)} samples) after E2E Epoch {epoch+1}...")
+            scores_subset = evaluate_pipeline(
+                pipeline=rag_pipeline_instance,
+                test_set=subset_test_data_for_epochs,
+                verbose=False,
+                log_path=os.path.join(CHECKPOINTS_DIR, f"e2e_subset_preds_epoch{epoch+1}.json"),
+                top_k=top_k_retrieval,
+                strategy="thorough",
             )
-            if epoch_loss_list:
-                 all_stage3_losses.extend(epoch_loss_list)
+            subset_eval_scores_e2e.append(scores_subset)
+            current_epoch_subset_f1 = scores_subset.get("F1", 0.0)
 
-            if test_data:
-                rag_pipeline_instance.generator.eval()
-                if hasattr(rag_pipeline_instance.dense_retriever, 'query_encoder'):
-                    rag_pipeline_instance.dense_retriever.query_encoder.eval()
-                
-                print(f"Evaluating Stage 3, Epoch {epoch+1}...")
-                scores = evaluate_pipeline(
-                    rag_pipeline_instance, 
-                    test_data, 
-                    verbose=False, 
-                    log_path=os.path.join(CHECKPOINTS_DIR, f"stage3_predictions_epoch{epoch+1}.json"), 
-                    top_k=top_k_retrieval
-                )
-                eval_scores_stage3.append(scores)
-                
-                print(f"Eval (Epoch {epoch+1}) — EM: {scores['EM']:.2f}%, F1: {scores['F1']:.2f}%")
+            answer_recall = compute_answer_recall(
+                rag_pipeline_instance,
+                subset_test_data_for_epochs,
+                k=top_k_retrieval
+            )
+
+            print(f"Answer-Recall@{top_k_retrieval}: {answer_recall:.2f}%")
+            if wandb.run:
+                wandb.log({f"Answer_Recall@{top_k_retrieval}_Subset": answer_recall})
+
+
+
+            print(f"Subset Eval (E2E Epoch {epoch+1}) — EM: {scores_subset.get('EM', 0.0):.2f}%, F1: {current_epoch_subset_f1:.2f}%")
+            if wandb.run:
                 wandb.log({
-                    "EM_Stage3": scores["EM"],
-                    "F1_Stage3": scores["F1"],
-                    "epoch_stage3": epoch + 1
+                    "EM_Subset_Eval_E2E": scores_subset.get("EM", 0.0),
+                    "F1_Subset_Eval_E2E": current_epoch_subset_f1,
+                    "Current_E2E_Epoch": epoch + 1
                 })
 
-                if scores["F1"] > best_f1_stage3:
-                    best_f1_stage3 = scores["F1"]
-                    print(f"✅ New best F1 in Stage 3: {best_f1_stage3:.2f}%. Saving model to {BEST_MODEL_DIR_STAGE3}...")
-                    rag_pipeline_instance.generator.save_pretrained(os.path.join(BEST_MODEL_DIR_STAGE3, "generator"))
-                    rag_pipeline_instance.tokenizer.save_pretrained(os.path.join(BEST_MODEL_DIR_STAGE3, "tokenizer"))
-                    if hasattr(rag_pipeline_instance.dense_retriever, 'save_query_encoder'):
-                        rag_pipeline_instance.dense_retriever.save_query_encoder(os.path.join(BEST_MODEL_DIR_STAGE3, "retriever_query_encoder"))
+            if current_epoch_subset_f1 > best_f1_on_subset_e2e:
+                best_f1_on_subset_e2e = current_epoch_subset_f1
+                patience_counter_e2e = 0
+                print(f"✅ New best F1 on SUBSET: {best_f1_on_subset_e2e:.2f}%. Saving model to {BEST_E2E_MODEL_DIR}...")
+                rag_pipeline_instance.generator.save_pretrained(os.path.join(BEST_E2E_MODEL_DIR, "generator"))
+                rag_pipeline_instance.tokenizer.save_pretrained(os.path.join(BEST_E2E_MODEL_DIR, "generator"))
+                if hasattr(rag_pipeline_instance.dense_retriever, 'save_query_encoder'):
+                    rag_pipeline_instance.dense_retriever.save_query_encoder(os.path.join(BEST_E2E_MODEL_DIR, "retriever_query_encoder"))
             else:
-                print("No test data loaded, skipping evaluation for Stage 3.")
-        print("End-to-End fine-tuning (Stage 3) complete.")
-    else:
-        print("\nSkipping Stage 3: End-to-End RAG fine-tuning")
+                patience_counter_e2e += 1
+                print(f"Subset F1 ({current_epoch_subset_f1:.2f}%) did not improve from best ({best_f1_on_subset_e2e:.2f}%). Patience: {patience_counter_e2e}/{PATIENCE_EPOCHS_E2E}.")
 
-    print(f"\n💾 Saving final model components to '{FINAL_MODEL_DIR}'...")
-    if hasattr(rag_pipeline_instance, 'generator') and rag_pipeline_instance.generator is not None:
-        rag_pipeline_instance.generator.save_pretrained(os.path.join(FINAL_MODEL_DIR, "generator"))
-        rag_pipeline_instance.tokenizer.save_pretrained(os.path.join(FINAL_MODEL_DIR, "tokenizer"))
-    else:
-        print("Generator not available for final saving (possibly skipped all training stages).")
+            if patience_counter_e2e >= PATIENCE_EPOCHS_E2E:
+                print(f"Early stopping triggered after E2E Epoch {epoch+1} due to no improvement on subset evaluation.")
+                break # Exit the training loop
+        else:
+            print("No subset test data available, skipping inter-epoch evaluation and early stopping for E2E training.")
 
-    if hasattr(rag_pipeline_instance, 'dense_retriever') and \
-       hasattr(rag_pipeline_instance.dense_retriever, 'save_query_encoder') and \
-       hasattr(rag_pipeline_instance.dense_retriever, 'query_encoder') and \
-       rag_pipeline_instance.dense_retriever.query_encoder is not None:
-        rag_pipeline_instance.dense_retriever.save_query_encoder(os.path.join(FINAL_MODEL_DIR, "retriever_query_encoder"))
-    else:
-        print("Retriever query encoder not available for final saving.")
-    print("Final model components potentially saved.")
+    print("\n--- End of E2E Training Phase ---")
 
 
-    if all_stage3_losses: 
+    # --- FINAL FULL EVALUATION ---
+    print("\n🧪 Performing Final Full Evaluation on the entire test set...")
+    rag_pipeline_instance.generator.eval()
+    if hasattr(rag_pipeline_instance.dense_retriever, 'query_encoder'):
+        rag_pipeline_instance.dense_retriever.query_encoder.eval()
+
+    print(f"Evaluating model on {len(full_test_data)} FULL test samples...")
+    final_full_scores = evaluate_pipeline(
+        pipeline=rag_pipeline_instance,
+        test_set=full_test_data,
+        verbose=True,
+        log_path=os.path.join(CHECKPOINTS_DIR, "final_e2e_FULL_predictions.json"),
+        top_k=top_k_retrieval,
+        strategy="thorough",
+    )
+    print("\n--- FINAL FULL Evaluation Scores ---")
+    print(f"Exact Match (EM): {final_full_scores.get('EM', 0.0):.2f}%")
+    print(f"F1 Score:         {final_full_scores.get('F1', 0.0):.2f}%")
+
+    if wandb.run:
+        wandb.log({
+            "EM_Final_FULL_TestSet_E2E": final_full_scores.get("EM", 0.0),
+            "F1_Final_FULL_TestSet_E2E": final_full_scores.get("F1", 0.0),
+        })
+    final_scores_path = os.path.join(CHECKPOINTS_DIR, "final_e2e_FULL_evaluation_scores.json")
+    with open(final_scores_path, 'w') as f:
+        json.dump(final_full_scores, f, indent=4)
+    print(f"Final FULL evaluation scores saved to {final_scores_path}")
+
+    if avg_losses_per_epoch_e2e:
         plt.figure(figsize=(10, 6))
-        plt.plot(all_stage3_losses, label='Stage 3 Training Loss (Avg per Batch)')
-        plt.xlabel("Training Batch (Cumulative in Stage 3)")
-        plt.ylabel("Loss")
-        plt.title("Stage 3 RAG End-to-End Training Loss")
+        epochs_ran = range(1, len(avg_losses_per_epoch_e2e) + 1)
+        plt.plot(epochs_ran, avg_losses_per_epoch_e2e, label='E2E Avg Training Loss per Epoch', marker='o')
+        plt.xlabel("E2E Training Epoch")
+        plt.ylabel("Average Loss")
+        plt.title("E2E RAG Training Loss (Average per Epoch)")
         plt.legend()
-        loss_plot_path = os.path.join(CHECKPOINTS_DIR, "training_loss_stage3.png")
+        plt.xticks(epochs_ran)
+        plt.grid(True)
+        loss_plot_path = os.path.join(CHECKPOINTS_DIR, "training_loss_e2e_epochs.png")
         plt.savefig(loss_plot_path)
-        wandb.log({"training_loss_plot_stage3": wandb.Image(loss_plot_path)})
-        print(f"Training loss plot saved to {loss_plot_path}")
+        if wandb.run: wandb.log({"training_loss_plot_e2e_epochs": wandb.Image(loss_plot_path)})
+        print(f"E2E training loss plot saved to {loss_plot_path}")
 
-    if eval_scores_stage3:
-        f1_scores_plot = [s["F1"] for s in eval_scores_stage3]
-        em_scores_plot = [s["EM"] for s in eval_scores_stage3]
-        epochs_plot = range(1, len(eval_scores_stage3) + 1)
+    if subset_eval_scores_e2e:
+        f1_scores_plot = [s.get("F1", 0.0) for s in subset_eval_scores_e2e]
+        em_scores_plot = [s.get("EM", 0.0) for s in subset_eval_scores_e2e]
+        epochs_plot = range(1, len(subset_eval_scores_e2e) + 1)
 
         plt.figure(figsize=(10, 6))
-        plt.plot(epochs_plot, f1_scores_plot, label='F1 Score (Stage 3)', marker='o', color='green')
-        plt.plot(epochs_plot, em_scores_plot, label='EM Score (Stage 3)', marker='x', color='blue')
-        plt.xlabel("Epoch (Stage 3)")
+        plt.plot(epochs_plot, f1_scores_plot, label='F1 Score (E2E on Subset)', marker='o', color='green')
+        plt.plot(epochs_plot, em_scores_plot, label='EM Score (E2E on Subset)', marker='x', color='blue')
+        plt.xlabel("E2E Training Epoch")
         plt.ylabel("Score (%)")
-        plt.title("Evaluation Scores Over Epochs (Stage 3)")
+        plt.title("E2E Evaluation Scores on Subset Over Epochs")
         plt.legend()
         plt.grid(True)
         plt.xticks(epochs_plot)
-        eval_plot_path = os.path.join(CHECKPOINTS_DIR, "eval_scores_stage3.png")
+        eval_plot_path = os.path.join(CHECKPOINTS_DIR, "eval_scores_e2e_subset.png")
         plt.savefig(eval_plot_path)
-        wandb.log({"evaluation_scores_plot_stage3": wandb.Image(eval_plot_path)})
-        print(f"Evaluation scores plot saved to {eval_plot_path}")
+        if wandb.run: wandb.log({"evaluation_scores_plot_e2e_subset": wandb.Image(eval_plot_path)})
+        print(f"E2E evaluation scores plot (on subset) saved to {eval_plot_path}")
 
-    wandb.finish()
+    if wandb.run:
+        wandb.finish()
     print("\n--- Main script execution finished ---")
+ 
+
 
 if __name__ == "__main__":
     main()
