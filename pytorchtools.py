@@ -1,3 +1,4 @@
+import os
 import torch
 
 class EarlyStopping:
@@ -28,6 +29,7 @@ class EarlyStopping:
             self.counter = 0
 
     def save_checkpoint(self, model):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         torch.save(model.state_dict(), self.path)
         if self.verbose:
             print(f"✅ Saved early stop checkpoint: {self.path}")

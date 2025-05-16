@@ -48,8 +48,25 @@ class RAGPipeline:
         # Enable gradient checkpointing to reduce memory consumption
         if hasattr(self.generator, "gradient_checkpointing_enable"):
             self.generator.gradient_checkpointing_enable()
-        # Set chunk size for generator loss computation
-        self.gen_loss_chunk_size = 8
+            logger_rag.info("Gradient checkpointing enabled on generator.")
+            # Also enable gradient checkpointing on encoder, if supported
+            if hasattr(self.generator.get_encoder(), "gradient_checkpointing_enable"):
+                self.generator.get_encoder().gradient_checkpointing_enable()
+                logger_rag.info("Gradient checkpointing enabled on encoder.")
+        # Set chunk size for generator loss computation dynamically based on GPU memory
+        try:
+            import torch
+            total_mem = torch.cuda.get_device_properties(device).total_memory
+            if total_mem >= 24e9:
+                self.gen_loss_chunk_size = 32
+            elif total_mem >= 16e9:
+                self.gen_loss_chunk_size = 16
+            else:
+                self.gen_loss_chunk_size = 8
+            logger_rag.info(f"gen_loss_chunk_size dynamically set to {self.gen_loss_chunk_size}")
+        except Exception as e:
+            self.gen_loss_chunk_size = 8
+            logger_rag.warning(f"Could not determine GPU memory, fallback to gen_loss_chunk_size=8: {e}")
 
         if self.train_generator or self.train_retriever_end_to_end:
             self._init_optimizers_and_scheduler()
@@ -162,31 +179,29 @@ class RAGPipeline:
             truncation=True,
             max_length=self.answer_max_length
         ).input_ids.to(self.device)
-        token_sums_list = []
+
         encoder = self.generator.get_encoder()
-        for i in range(0, n_docs, self.gen_loss_chunk_size):
-            chunk_ids = doc_input_ids[i : i + self.gen_loss_chunk_size]
-            chunk_mask = doc_attention_mask[i : i + self.gen_loss_chunk_size]
-            enc_out = encoder(
-                input_ids=chunk_ids,
-                attention_mask=chunk_mask,
+        enc_out = encoder(
+            input_ids=doc_input_ids,
+            attention_mask=doc_attention_mask,
+            return_dict=True
+        )
+        import time
+        gen_start = time.time()
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
+            outputs = self.generator(
+                encoder_outputs=enc_out,
+                decoder_input_ids=labels,
+                decoder_attention_mask=(labels != self.tokenizer.pad_token_id),
                 return_dict=True
             )
-            with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
-                outputs = self.generator(
-                    encoder_outputs=enc_out,
-                    decoder_input_ids=labels[i : i + self.gen_loss_chunk_size],
-                    decoder_attention_mask=(labels[i : i + self.gen_loss_chunk_size] != self.tokenizer.pad_token_id),
-                    return_dict=True
-                )
-            seq_logits = outputs.logits  # [chunk, target_len, vocab]
-            logprobs = F.log_softmax(seq_logits, dim=-1)
-            ll = logprobs.gather(dim=-1, index=labels[i : i + self.gen_loss_chunk_size].unsqueeze(-1)).squeeze(-1)
-            ll.masked_fill_(labels[i : i + self.gen_loss_chunk_size].eq(self.tokenizer.pad_token_id), 0.0)
-            token_sums_list.append(ll.sum(dim=1))
-            del outputs, seq_logits, logprobs, enc_out
-            torch.cuda.empty_cache()
-        token_sums = torch.cat(token_sums_list, dim=0)
+        gen_duration = time.time() - gen_start
+        mem_reserved = torch.cuda.memory_reserved() / 1e9 if self.device.type == "cuda" else 0
+        seq_logits = outputs.logits  # [n_docs, target_len, vocab]
+        logprobs = F.log_softmax(seq_logits, dim=-1)
+        ll = logprobs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        ll.masked_fill_(labels.eq(self.tokenizer.pad_token_id), 0.0)
+        token_sums = ll.sum(dim=1)
         log_doc_probs = torch.log(doc_probs_p_z_given_x.clamp_min(1e-9))
         marginal_ll = torch.logsumexp(token_sums + log_doc_probs, dim=0)
         nll_loss = -marginal_ll
@@ -224,10 +239,17 @@ class RAGPipeline:
         # Accumulate loss over the batch before scaling and backward pass
         # This is often more stable than calling backward on each item, especially with AMP
         accumulated_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        
         valid_items_count = 0
 
-        for item in batch_data:
+        # --- Batched Retrieval for all queries in the batch ---
+        import time
+        retrieval_start = time.time()
+        queries = [item.get("query") for item in batch_data]
+        retrieved_docs_list = [self._retrieve_topk_docs(q, self.k_retrieval_for_inference) for q in queries]
+        retrieval_duration = time.time() - retrieval_start
+        logger_rag.info(f"Retrieval time for batch: {retrieval_duration:.3f} seconds")
+
+        for idx, item in enumerate(batch_data):
             query = item.get("query")
             answers = item.get("answers")
             positive_docs = item.get("positive_docs", []) 
@@ -241,22 +263,26 @@ class RAGPipeline:
 
             # --- Retrieval depending on mode ---
             if not self.train_retriever_end_to_end:
-                # Live FAISS retrieval path
-                retrieved = self._retrieve_topk_docs(query, self.k_retrieval_for_inference)
+                # Live FAISS retrieval path (batched retrieval)
+                retrieved = retrieved_docs_list[idx]
                 if not retrieved:
                     logger_rag.warning(f"No docs retrieved for query '{query[:50]}...', skipping.")
                     continue
                 doc_input_ids      = torch.stack([d["input_ids"] for d in retrieved])
                 doc_attention_mask = torch.stack([d["attention_mask"] for d in retrieved])
                 doc_probs          = torch.stack([d["p_z_given_x"] for d in retrieved])
+                candidate_texts = [d["text"] for d in retrieved]
+                doc_probs_for_log = doc_probs
+                retrieved_docs = retrieved  # for logging
             else:
-                # Differentiable retrieval path
-                candidate_texts, doc_probs = self._get_differentiable_retrieval_outputs_for_training(
-                    query, positive_docs, negative_docs
-                )
-                if not candidate_texts or doc_probs.numel() == 0:
-                    logger_rag.warning(f"No valid differentiable docs for '{query[:50]}...', skipping.")
+                # Differentiable retrieval path using live retriever search for top-k docs (batched retrieval)
+                retrieved_docs = retrieved_docs_list[idx]
+                if not retrieved_docs:
+                    logger_rag.warning(f"No docs retrieved for query '{query[:50]}...', skipping.")
                     continue
+                candidate_texts = [d["text"] for d in retrieved_docs]
+                doc_probs = torch.stack([d["p_z_given_x"] for d in retrieved_docs])
+                doc_probs_for_log = doc_probs
                 tok = self.tokenizer(
                     candidate_texts,
                     return_tensors="pt",
@@ -266,6 +292,16 @@ class RAGPipeline:
                 ).to(self.device)
                 doc_input_ids      = tok.input_ids
                 doc_attention_mask = tok.attention_mask
+
+            # Attempt to find rank of the gold (positive) doc among retrieved ones
+            retrieved_texts = [d.get("text", "") for d in retrieved_docs]
+            gold_doc_text = positive_docs[0] if isinstance(positive_docs, list) and positive_docs else None
+            gold_doc_rank = None
+            if gold_doc_text:
+                for rank, txt in enumerate(retrieved_texts):
+                    if gold_doc_text.strip()[:200] in txt:
+                        gold_doc_rank = rank + 1  # 1-based indexing
+                        break
 
             # Compute RAG loss
             loss_for_item = self._calculate_rag_nll_loss(
@@ -282,6 +318,24 @@ class RAGPipeline:
 
             accumulated_loss = accumulated_loss + loss_for_item
             valid_items_count += 1
+
+            # --- Wandb Logging of Retrieved Docs ---
+            if wandb.run:
+                try:
+                    doc_titles_or_ids = [d.get("title", f"Doc-{i}") for i, d in enumerate(retrieved_docs)]
+                    doc_original_scores = [d.get("original_score", -1.0) for d in retrieved_docs]
+                    wandb.log({
+                        "query": query,
+                        "answer": answer,
+                        "retrieved_doc_titles": doc_titles_or_ids,
+                        "retrieved_doc_original_scores": doc_original_scores,
+                        "retrieved_docs": wandb.Html("<hr>".join(
+                            [f"<b>p(z|x): {float(prob):.4f}</b><br>{text[:300]}..." for text, prob in zip(candidate_texts, doc_probs_for_log)]
+                        )),
+                        "gold_doc_rank": gold_doc_rank,
+                    })
+                except Exception as e:
+                    logger_rag.warning(f"Failed to log retrieved docs to wandb for query '{query[:50]}...': {e}")
 
 
         # --- Backward Pass and Optimizer Step (if any valid items) ---

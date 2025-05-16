@@ -1,25 +1,35 @@
 import os
 import torch
 import json
-from rag_pipeline import RAGPipeline
-from Dense_Retriever import DenseRetriever
-from evaluate import evaluate_pipeline  # Import your evaluation code
+from pipeline import RAGPipeline
+from retriever import DenseRetriever
+from _evaluate import evaluate_pipeline  # Import your evaluation code
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_flatip_index" 
+METADATA_PATH = "/local00/student/shakya/wikipedia_metadata.jsonl"
+
 # Load retriever
 retriever = DenseRetriever(
-    index_path="wikipedia_faiss_index",
-    metadata_path="wikipedia_metadata.jsonl",
+    model_name= "models/retriever_finetuned_e5_best",
+    index_path=FAISS_INDEX_PATH,
+    metadata_path=METADATA_PATH,
     device=device,
     fine_tune=False
 )
 
 # Load RAG pipeline
-rag = RAGPipeline(dense_retriever=retriever, device=device, fine_tune=False, k=50)
+rag = RAGPipeline(
+    dense_retriever=retriever,
+    device=device,
+    fine_tune=False,
+    k=50,
+    model_name="models/generator_best"
+)
 
 rag.generator.eval()
 rag.dense_retriever.model.eval()
@@ -32,7 +42,7 @@ with open("downloads/data/retriever/nq-dev.json") as f:
 outputs = []
 
 # Process first 20 samples
-for i, sample in enumerate(test_data[:50]):
+for i, sample in enumerate(test_data[:100]):
     query = sample["question"]
     references = sample["answers"]
 
@@ -47,7 +57,7 @@ for i, sample in enumerate(test_data[:50]):
         })
 
     # Generate answer (thorough strategy)
-    prediction = rag.generate_answer(query, strategy="thorough", top_k=10)
+    prediction = rag.generate_answers_batch(query, strategy="thorough", top_k=10)
 
     outputs.append({
         "query": query,

@@ -34,6 +34,7 @@ class DenseRetriever:
         self.model_name = model_name
         self.fine_tune_enabled = fine_tune
         self.index = faiss.read_index(index_path) # Used for inference/search
+
         # unwrap any wrapper indices (IDMap, IDMap2, Replicas, Shards) to get the raw HNSW index
         inner = self.index
         while hasattr(inner, "index"):
@@ -68,6 +69,10 @@ class DenseRetriever:
         self.use_fp16 = use_fp16
 
         self.query_encoder = SentenceTransformer(model_name).to(device)
+        # Enable gradient checkpointing if available
+        if hasattr(self.query_encoder, "gradient_checkpointing_enable"):
+            self.query_encoder.gradient_checkpointing_enable()
+            logger_retriever.info("Gradient checkpointing enabled on query encoder.")
         self.doc_encoder = SentenceTransformer(model_name).to(device) # Used for on-the-fly encoding
 
         self._freeze_encoder(self.doc_encoder) # Document encoder typically frozen for RAG retriever tuning
@@ -243,6 +248,7 @@ class DenseRetriever:
                 attention_mask = torch.from_numpy(attention_mask_np).long().to(self.device)
             else:
                 # on-demand tokenize
+                text = self._apply_model_specific_prefixes([text], "passage")[0]
                 tok = self.passage_tokenizer(
                     text,
                     return_tensors="pt",
@@ -391,6 +397,8 @@ class DenseRetriever:
                         "title": metadata_entry.get("title", "")
                     })
             batch_results.append(single_query_results)
+        if torch.cuda.is_available():
+            logger_retriever.info(f"batch_search: CUDA memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
         return batch_results
 
     @classmethod

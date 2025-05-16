@@ -1,5 +1,34 @@
 import string
 import re
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+import json
+import random
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import batch_to_device
+from tqdm import tqdm
+import wandb
+from torch.cuda.amp import GradScaler
+from pytorchtools import EarlyStopping
+from sentence_transformers.util import batch_to_device
+
+# Generator imports
+from transformers import BartTokenizer, BartForConditionalGeneration
+
+# Configuration
+DATA_PATH = "downloads/data/retriever/nq-train.json"
+VAL_PATH = "downloads/data/retriever/nq-dev.json"
+MODEL_NAME = "intfloat/e5-large-v2"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 8
+EPOCHS = 10
+SAVE_PATH = "models"
+
+wandb.init(project="rag-retriever", name="fine-tune-e5", id="ougd4jsd",     
+    resume="must", )
 
 # Normalization and scoring functions for multi-answer EM/F1 evaluation
 def normalize_answer(s):
@@ -31,36 +60,6 @@ def f1_score(prediction, gold_answers):
         recall = num_same / len(gold_tokens)
         return (2 * precision * recall) / (precision + recall)
     return max([score(gold, prediction) for gold in gold_answers])
-
-
-
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
-import json
-import random
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import batch_to_device
-from tqdm import tqdm
-import wandb
-from torch.cuda.amp import GradScaler
-from pytorchtools import EarlyStopping
-
-# Generator imports
-from transformers import BartTokenizer, BartForConditionalGeneration
-
-# Configuration
-DATA_PATH = "downloads/data/retriever/nq-train.json"
-VAL_PATH = "downloads/data/retriever/nq-dev.json"
-MODEL_NAME = "intfloat/e5-large-v2"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 8
-EPOCHS = 10
-SAVE_PATH = "models"
-
-wandb.init(project="rag-retriever", name="fine-tune-e5")
 
 def load_dpr_data(path, max_negs=2):
     with open(path) as f:
@@ -207,7 +206,6 @@ class RetrieverTrainer:
         self.last_batch_examples = None
 
     def train_step(self, queries, positives, negatives):
-        from sentence_transformers.util import batch_to_device
 
         all_queries = queries
         all_passages = positives + negatives

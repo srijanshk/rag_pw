@@ -1,49 +1,167 @@
-# import json
-
-# path = "downloads/data/retriever/nq-train.json"
-
-# with open(path, "r") as f:
-#     data = json.load(f)
-
-# for i in range(1):
-#     print(f"📄 Entry {i+1}:")
-#     print(data[i])
-#     print("-" * 50)
-
-
-# # import csv
-
-# # tsv_path = "downloads/data/wikipedia_split/psgs_w100.tsv" 
-
-# # with open(tsv_path, "r", encoding="utf-8") as f:
-# #     reader = csv.reader(f, delimiter="\t")
-# #     for i, row in enumerate(reader):
-# #         print(f"Row {i+1}: {row}")
-# #         if i >= 20:  # Show only the first 5 rows
-# #             break
 import os
+import torch
+import json
+from pipeline import RAGPipeline
+from retriever import DenseRetriever
+from _evaluate import evaluate_pipeline
+from tqdm import tqdm
+import wandb 
+
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"
-import time
-from sentence_transformers import SentenceTransformer
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-model = SentenceTransformer("intfloat/e5-large-v2").to("cuda")
-# grab 512 example passages
-sample_texts = ["passage: Does He Love You \"Does He Love You\" is a song written by Sandy Knox and Billy Stritch, and recorded as a duet by American country music artists Reba McEntire and Linda Davis. It was released in August 1993 as the first single from Reba's album \"Greatest Hits Volume Two\". It is one of country music's several songs about a love triangle. \"Does He Love You\" was written in 1982 by Billy Stritch. He recorded it with a trio in which he performed at the time, because he wanted a song that could be sung by the other two members"] * 512
+FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_hnsw_index"
+METADATA_PATH   = "/local00/student/shakya/wikipedia_metadata.jsonl"
 
-# warm up
-_ = model.encode(sample_texts, batch_size=512, device="cuda")
+wandb.init(
+    project="retriever_evaluation",
+    name="retriever_evaluation",
+    config={
+        "faiss_index_path": FAISS_INDEX_PATH,
+        "metadata_path": METADATA_PATH,
+        "device": str(device),
+        "model_name": "models/retriever_finetuned_e5_best",
+        "test_data_path": "downloads/data/retriever/nq-dev.json"
+    }
+)
 
-# timed run
-start = time.time()
-_ = model.encode(sample_texts, batch_size=512, device="cuda")
-elapsed = time.time() - start
+# --- 1. Load retriever ---
+retriever = DenseRetriever(
+    model_name=     "models/retriever_finetuned_e5_best",
+    index_path=     FAISS_INDEX_PATH,
+    metadata_path=  METADATA_PATH,
+    device=         device,
+    fine_tune=      False,
+    ef_search=1500,
+    ef_construction=200,
+)
 
-secs_per_passage = elapsed / 512
-# count total passages in your TSV (minus header)
-total_passages = sum(1 for _ in open("downloads/data/wikipedia_split/psgs_w100.tsv")) - 1
+# --- 2. Load test data ---
+with open("downloads/data/retriever/nq-dev.json") as f:
+    test_data = json.load(f)
 
-estimated_seconds = total_passages * secs_per_passage
-estimated_hours   = estimated_seconds / 3600
+# --- 3. Retriever evaluation helper ---
+def extract_snippets(retrieved):
+    if not retrieved:
+        return []
+    first = retrieved[0]
+    # tuple format:  (metadata_dict, score_float)
+    if isinstance(first, tuple) and len(first) == 2:
+        return [meta["text"] for meta, _ in retrieved]
+    # dict format:    {"id":…, "text":…, "score":…}
+    elif isinstance(first, dict):
+        return [doc["text"] for doc in retrieved]
+    else:
+        raise ValueError(f"Unrecognized retrieved format: {type(first)}")
 
-print(f"≈ {secs_per_passage:.4f}s per passage")
-print(f"≈ {estimated_hours:.1f} hours to embed all passages")
+def evaluate_retriever(retriever, data, k_values=[10,20,50,100], sample_size=None):
+    if sample_size:
+        data = data[:sample_size]
+    total = len(data)
+    print(f"Evaluating retriever on {total} samples")
+    recalls = {}
+    for k in k_values:
+        hits = 0
+        for sample in tqdm(data, desc=f"Evaluating for k={k}"):
+            query   = sample["question"]
+            answers = sample["answers"]
+            retrieved = retriever.search(query, k=k)
+            snippets = extract_snippets(retrieved)
+            if any(
+                any(ans.lower() in snippet.lower() for snippet in snippets)
+                for ans in answers
+            ):
+                hits += 1
+        recall = hits / total
+        print(f"  Recall@{k}: {recall:.3f}")
+        recalls[k] = recall
+    return recalls
+
+# --- 4. Run retriever evaluation ---
+# evaluate_retriever(retriever, test_data, k_values=[1,5,20,50], sample_size=1000)
+
+
+# ef_search_vals       = [500, 1000, 1500, 2000, 2500]
+# ef_construction_vals = [100]                                        
+
+# results = []
+# for ef_s in ef_search_vals:
+#     for ef_c in ef_construction_vals:
+#         # 3. Tweak the live index
+#         retriever.update_hnsw_params(ef_search=ef_s, ef_construction=ef_c)
+
+#         # 4. Re-run your recall eval
+#         metrics = evaluate_retriever(
+#             retriever,
+#             test_data,
+#             k_values=[1,5,20,50],
+#             sample_size=1000
+#         )
+
+#         # 5. Log & collect
+#         wandb.log({
+#             **{f"Recall@{k}": v for k, v in metrics.items()},
+#             "ef_search":      ef_s,
+#             "ef_construction": ef_c,
+#         })
+#         results.append({
+#             "ef_search":       ef_s,
+#             "ef_construction": ef_c,
+#             **{f"Recall@{k}": v for k, v in metrics.items()}
+#         })
+
+# # 6. Print a summary
+# print("Grid Search Results:")
+# for r in results:
+#     print(r)
+
+# # --- 5. Load RAG pipeline for end-to-end testing ---
+rag = RAGPipeline(
+    dense_retriever=retriever,
+    device=device,
+    train_generator=False,
+    train_retriever_end_to_end=False,
+    k_retrieval_for_inference=10,
+    model_name="models/generator_best"
+)
+rag.generator.eval()
+rag.dense_retriever.query_encoder.eval()
+
+# # # --- 6. Retrieval + Generation loop (first 100) ---
+outputs = []
+for sample in test_data:
+    query      = sample["question"]
+    references = sample["answers"]
+
+    outputs.append({
+        "query":         query,
+        "references":    references,
+    })
+
+# # # --- 7. Save retrieval+generation outputs ---
+# os.makedirs("outputs", exist_ok=True)
+# with open("outputs/test_outputs.json", "w") as f:
+#     json.dump(outputs, f, indent=2)
+# print("✅ Retrieval+Generation outputs saved to outputs/test_outputs.json")
+
+# # # --- 8. Evaluate end‐to‐end with your existing evaluator ---
+eval_data = [
+    {"query": out["query"], "answers": out["references"]}
+    for out in outputs
+]
+metrics = evaluate_pipeline(
+    pipeline=rag,
+    test_set=eval_data,
+    verbose=True,
+    log_path="outputs/evaluation_log.json",
+    strategy="thorough",
+    top_k=50,
+)
+print("\n✅ End‐to‐End Evaluation Metrics:")
+print(metrics)
+
+wandb.log({
+    "metrics": metrics,
+})
+wandb.finish()

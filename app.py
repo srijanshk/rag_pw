@@ -1,6 +1,6 @@
 import os
 from typing import List
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,2,3" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "2" 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import json
@@ -12,7 +12,7 @@ import wandb
 
 from retriever import DenseRetriever
 from pipeline import RAGPipeline
-from evaluate import evaluate_pipeline
+from _evaluate import evaluate_pipeline
 
 CHECKPOINTS_DIR = "checkpoints"
 BEST_E2E_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "best_model_single_stage_e2e")
@@ -57,7 +57,7 @@ def load_dpr_json(path):
         if not positive_texts:
             continue
 
-        hard_negs = [ctx.get("text", "") for ctx in hard_neg_ctxs[:3] if ctx.get("text", "")]
+        hard_negs = [ctx.get("text", "") for ctx in hard_neg_ctxs[:2] if ctx.get("text", "")]
 
         processed.append({
             "query": query,
@@ -101,7 +101,7 @@ def compute_answer_recall(rag_pipeline: RAGPipeline,
 
 
 def main():
-    batch_size_rag = 8
+    batch_size_rag = 4
 
 
     retriever_model_name = "models/retriever_finetuned_e5_best"
@@ -112,7 +112,7 @@ def main():
         id2row_map = json.load(f)
     num_passages = len(id2row_map)
 
-    top_k_retrieval = 10
+    top_k_retrieval = 5
 
     run_name = f"RAG_SingleStage_E2E_{MAX_EPOCHS_E2E}maxEp_P{PATIENCE_EPOCHS_E2E}"
     wandb.init(
