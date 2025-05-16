@@ -23,13 +23,8 @@ checkpoints/*
 downloads/*
 models/*
 mpnet/*
-wikipedia_faiss_index
-wikipedia_metadata.jsonl
-stage1_predictions_epoch1.json
-training_loss.png
-f1_score.png
-f1_score_dense.png
-EM_score.png
+best_bart_model/*
+rag_custom_trained_final_v3/*
 
 
 # Other temporary files
