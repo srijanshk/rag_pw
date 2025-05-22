@@ -7,7 +7,6 @@ from RagUtils import hybrid_retrieve_documents_for_batch, prepare_generator_inpu
 import evaluate
 from typing import List, Dict, Any, Tuple
 
-# Import a type hint for models, tokenizer, and DenseRetriever
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
 # calculate_metrics function (as defined before)
