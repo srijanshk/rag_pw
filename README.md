@@ -5,7 +5,24 @@
 Follow the detailed instructions in the sections below to set up the project and execute the workflow. Ensure all prerequisites are met before proceeding with the installation and data processing steps.
 
 
-
+## Folder Structure
+```bash
+rag_pw
+├── README.md
+├── utils
+│   ├── download_data.py
+├── misc
+├── main.py #Main File to Execute
+├── NqDataset.py  
+├── QuestionEncoder.py 
+├── DenseRetriever.py 
+├── RagUtils.py 
+├── RagEval.py 
+├── xapian_retriever.py 
+├── document_vector_index.py 
+├── generate_xapian_index.py 
+└── utils.py
+```
 ## Quick Installation Guide
 
 1. **Install Prerequisites**
@@ -71,5 +88,24 @@ Follow [DPR repo](https://github.com/facebookresearch/DPR.git) in order to downl
 1. Download QA pairs by `python utils/download_data.py --resource data.retriever.qas` and `python3 data/download_data.py --resource data.retriever.nq`.
 2. Download wikipedia DB by `python utils/download_data.py --resource data.wikipedia_split`.
 3. Download gold question-passage pairs by `python utils/download_data.py --resource data.gold_passages_info`.
-4. To make the subset of the data `python filter_subset_wiki.py --db_path downloads/data/wikipedia_split/psgs_w100.tsv --data_path downloads/data/retriever/nq-train.json`
 
+#### Fine Tune Retriever and Generator
+
+```bash
+python misc/train_retriever.py
+python misc/train_generator.py
+```
+#### Generate Vector Index (FAISS)
+
+```bash
+python document_vector_index.py
+```
+#### Generate Xapian Index
+```bash
+python generate_xapian_index.py
+```
+
+#### Run End-to-End Training
+```bash
+python main.py
+```
