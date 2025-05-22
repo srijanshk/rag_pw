@@ -1,4 +1,4 @@
-### RAG_PW
+### Retrieval Augmented Generation
 
 ## Getting Started
 
