@@ -5,7 +5,8 @@ from transformers import PreTrainedTokenizerFast # For type hinting, or AutoToke
 
 class NQDataset(Dataset):
     def __init__(self, 
-                 data_list: List[Dict[str, Any]], 
+                 data_list: List[Dict[str, Any]],
+                 sparse_retrieval_data: Dict[str, List[Dict[str, Any]]], # Pre computed sparse retrieval data
                  question_tokenizer: PreTrainedTokenizerFast,
                  generator_tokenizer: PreTrainedTokenizerFast,
                  max_question_length: int, 
@@ -19,6 +20,7 @@ class NQDataset(Dataset):
             max_answer_length: Max length for tokenized answers (labels).
         """
         self.dataset_entries = data_list
+        self.sparse_retrieval_data = sparse_retrieval_data
         self.question_tokenizer = question_tokenizer
         self.generator_tokenizer = generator_tokenizer
         self.max_question_length = max_question_length
@@ -35,6 +37,8 @@ class NQDataset(Dataset):
         
         short_answers_list = entry.get("short_answers", [])
         # Ensure short_answers_list contains strings, take the first one
+
+        precomputed_sparse_docs = self.sparse_retrieval_data.get(original_question_str, [])
         original_answer_str = ""
         if short_answers_list:
             if isinstance(short_answers_list[0], str):
@@ -67,5 +71,6 @@ class NQDataset(Dataset):
             "attention_mask": question_tokenized.attention_mask.squeeze(0), # Remove batch dim
             "labels": labels_tokenized.input_ids.squeeze(0), # Remove batch dim
             "original_question": original_question_str,
-            "original_answer": original_answer_str 
+            "original_answer": original_answer_str,
+            "precomputed_sparse_docs": precomputed_sparse_docs
         }

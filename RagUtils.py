@@ -309,3 +309,104 @@ def calculate_rag_loss(
     final_loss = -marginal_log_likelihood_per_question.mean() # Scalar
 
     return final_loss
+
+def hybrid_retrieve_documents_for_batch(
+    query_embeddings_batch: torch.Tensor,
+    batch_precomputed_sparse_docs: List[List[Dict[str, Any]]], # From DataLoader [batch_size, k_sparse_precomputed]
+    dense_retriever,
+    final_k: int,
+    k_dense_to_fetch: int,
+    device: torch.device,
+    fusion_k_constant: int = 60 # For RRF
+) -> Dict[str, Any]:
+    batch_size = query_embeddings_batch.shape[0]
+
+    # 1. Perform Online Dense Retrieval (using your existing retrieve_documents_for_batch logic internally)
+    dense_retrieval_results = retrieve_documents_for_batch( # Your existing function
+        query_embeddings_batch, dense_retriever, k_dense_to_fetch, True
+    )
+    # dense_retrieval_results is a dict like:
+    # { "retrieved_doc_texts": List[List[str]], "retrieved_doc_titles": List[List[str]],
+    #   "retrieved_doc_embeddings": torch.Tensor, "retrieved_doc_faiss_ids": np.ndarray,
+    #   "retrieved_doc_faiss_distances": np.ndarray }
+
+    final_batch_doc_texts = [[""]*final_k for _ in range(batch_size)]
+    final_batch_doc_titles = [[""]*final_k for _ in range(batch_size)]
+    final_batch_doc_embeddings = torch.zeros(
+        (batch_size, final_k, dense_retriever.doc_encoder.get_sentence_embedding_dimension()),
+        dtype=torch.float, device=device
+    )
+
+    for i in range(batch_size):
+        # --- Fusion Logic (e.g., Reciprocal Rank Fusion - RRF) ---
+        # a. Get dense results for current query
+        dense_ids = dense_retrieval_results["retrieved_doc_faiss_ids"][i]
+        # Convert dense distances to scores (higher is better, e.g., 1/(1+distance) or use dot product if available)
+
+        # b. Get sparse results for current query (these are precomputed)
+        sparse_docs_for_query_i = batch_precomputed_sparse_docs[i] # List of {"id", "sparse_score", ...}
+
+        # c. Perform RRF
+        rrf_scores = {}
+        # Process dense results
+        for rank, doc_id in enumerate(dense_ids):
+            if doc_id == -1: continue
+            doc_id_str = str(doc_id)
+            rrf_scores[doc_id_str] = rrf_scores.get(doc_id_str, 0) + 1.0 / (fusion_k_constant + rank + 1)
+
+        # Process sparse results
+        for rank, sparse_doc_info in enumerate(sparse_docs_for_query_i):
+            doc_id_str = str(sparse_doc_info["id"])
+            rrf_scores[doc_id_str] = rrf_scores.get(doc_id_str, 0) + 1.0 / (fusion_k_constant + rank + 1)
+
+        # d. Sort by RRF score and select top final_k
+        sorted_fused_doc_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+        top_final_k_ids_str = sorted_fused_doc_ids[:final_k]
+
+        # e. Gather texts, titles, and compute/fetch DENSE embeddings for these top_final_k_ids_str
+        current_final_texts = []
+        current_final_titles = []
+        doc_ids_for_embedding_lookup = [] # IDs for which we need dense embeddings
+
+        # Map ID to its original dense embedding if already retrieved by dense stage
+        dense_embeddings_map = {
+            str(dense_retrieval_results["retrieved_doc_faiss_ids"][i][j]): dense_retrieval_results["retrieved_doc_embeddings"][i][j]
+            for j in range(len(dense_retrieval_results["retrieved_doc_faiss_ids"][i]))
+            if dense_retrieval_results["retrieved_doc_faiss_ids"][i][j] != -1
+        }
+
+        texts_to_embed_on_the_fly = []
+        indices_for_on_the_fly_embeddings = [] # To place them back correctly
+
+        for j, doc_id_str in enumerate(top_final_k_ids_str):
+            metadata_entry = dense_retriever.metadata.get(doc_id_str, {})
+            title = metadata_entry.get("title", "")
+            text = metadata_entry.get("text", "")
+            final_batch_doc_texts[i][j] = text
+            final_batch_doc_titles[i][j] = title
+
+            if doc_id_str in dense_embeddings_map:
+                final_batch_doc_embeddings[i, j, :] = dense_embeddings_map[doc_id_str]
+            elif text: # Needs on-the-fly embedding
+                texts_to_embed_on_the_fly.append(text)
+                indices_for_on_the_fly_embeddings.append((i, j))
+            # else it remains zero vector if no text and not in dense map
+
+        if texts_to_embed_on_the_fly:
+            dense_retriever.doc_encoder.eval()
+            with torch.no_grad():
+                prefixed_texts = dense_retriever._apply_model_specific_prefixes(texts_to_embed_on_the_fly, "passage")
+                on_the_fly_embeddings = dense_retriever.doc_encoder.encode(
+                    prefixed_texts, convert_to_tensor=True,
+                    normalize_embeddings=("e5" in dense_retriever.model_name.lower()),
+                    device=dense_retriever.device
+                )
+                for k_emb, (batch_loc_i, batch_loc_j) in enumerate(indices_for_on_the_fly_embeddings):
+                    final_batch_doc_embeddings[batch_loc_i, batch_loc_j, :] = on_the_fly_embeddings[k_emb]
+
+    return {
+        "retrieved_doc_texts": final_batch_doc_texts,
+        "retrieved_doc_titles": final_batch_doc_titles,
+        "retrieved_doc_embeddings": final_batch_doc_embeddings, # Dense embeddings for all final_k docs
+        # You might want to return the fused IDs and their RRF scores too for logging/debugging
+    }

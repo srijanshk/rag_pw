@@ -25,6 +25,9 @@ models/*
 mpnet/*
 best_bart_model/*
 rag_custom_trained_final_v3/*
+rag_train_final_v3/*
+rag_train_hybrid_final_v3/*
+rag_train_hybrid_final_v4/*
 
 
 # Other temporary files

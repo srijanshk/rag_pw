@@ -1,344 +1,176 @@
 import os
-from typing import List
-os.environ["CUDA_VISIBLE_DEVICES"] = "2" 
+
+import pandas as pd
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import json
-import matplotlib.pyplot as plt
+import traceback
 import numpy as np
-from tqdm import tqdm
 import torch
-import wandb 
+from typing import List, Dict, Any, Tuple
 
-from retriever import DenseRetriever
-from pipeline import RAGPipeline
-from _evaluate import evaluate_pipeline
+from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM
+from torch.utils.data import DataLoader
+import faiss
 
-CHECKPOINTS_DIR = "checkpoints"
-BEST_E2E_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "best_model_single_stage_e2e")
-FINAL_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "final_model_E2E")
-
-os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-os.makedirs(BEST_E2E_MODEL_DIR, exist_ok=True)
-
-TRAIN_FILE = "downloads/data/retriever/nq-train.json"
-TEST_FILE = "downloads/data/retriever/nq-dev.json"
-FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_hnsw_index" 
-METADATA_PATH = "/local00/student/shakya/wikipedia_metadata.jsonl"
-
-MAX_EPOCHS_E2E = 10      
-PATIENCE_EPOCHS_E2E = 3   
-SUBSET_EVAL_SIZE = 1500 
+from NqDataset import NQDataset
+from QuestionEncoder import QuestionEncoder
+from DenseRetriever import DenseRetriever
+from RagUtils import calculate_rag_loss, prepare_generator_inputs, retrieve_documents_for_batch
+from utils import load_local_nq_json, custom_collate_fn, load_precomputed_sparse_results
+from RagEval import evaluate_custom_rag_model
 
 
-def load_dpr_json(path):
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: Data file not found at {path}")
-        return []
-    except json.JSONDecodeError:
-        print(f"Error: Could not decode JSON from {path}")
-        return []
+current_wandb_run = None
 
-    processed = []
-    for item in data:
-        query = item.get("question")
-        answers = item.get("answers", [])
-        pos_ctxs = item.get("positive_ctxs", [])
-        hard_neg_ctxs = item.get("hard_negative_ctxs", [])
-
-        if not query or not pos_ctxs:
-            continue
-
-        pos_ctxs_sorted = sorted(pos_ctxs, key=lambda x: x.get("score", 0), reverse=True)
-        positive_texts = [ctx.get("text", "") for ctx in pos_ctxs_sorted[:2] if ctx.get("text", "")]
-        if not positive_texts:
-            continue
-
-        hard_negs = [ctx.get("text", "") for ctx in hard_neg_ctxs[:2] if ctx.get("text", "")]
-
-        processed.append({
-            "query": query,
-            "positive_docs": positive_texts,
-            "negative_docs": hard_negs,
-            "answers": answers
-        })
-    return processed
-
-def compute_answer_recall(rag_pipeline: RAGPipeline,
-                          dataset: List[dict],
-                          k: int) -> float:
-    """
-    Returns “Answer Recall@k”: the percentage of queries in the dataset
-    for which at least one of the top-k retrieved passages
-    contains the gold answer text.
-    """
-    hits = 0
-    for item in tqdm(dataset, desc=f"Answer‐Recall@{k} eval", leave=False):
-        query = item["query"]
-        gold_answers = item["answers"]
-
-        # Retrieve top-k docs via FAISS
-        retrieved = rag_pipeline.dense_retriever.search(query, k)
-        texts = [r["text"].lower() for r in retrieved]
-
-        # Check if any retrieved doc contains any of the gold answers
-        found = False
-        for ans in gold_answers:
-            ans_norm = ans.strip().lower()
-            if not ans_norm:
-                continue
-            if any(ans_norm in doc_text for doc_text in texts):
-                found = True
-                break
-
-        if found:
-            hits += 1
-
-    return hits / len(dataset) * 100.0
-
-
-def main():
-    batch_size_rag = 4
-
-
-    retriever_model_name = "models/retriever_finetuned_e5_best"
-    generator_model_name = "best_bart_model"
-
-    # Load passage ID→row map to determine number of passages for memmap
-    with open("/local00/student/shakya/id2row.json", "r", encoding="utf-8") as f:
-        id2row_map = json.load(f)
-    num_passages = len(id2row_map)
-
-    top_k_retrieval = 5
-
-    run_name = f"RAG_SingleStage_E2E_{MAX_EPOCHS_E2E}maxEp_P{PATIENCE_EPOCHS_E2E}"
-    wandb.init(
-        project="rag-qa-e2e-simplified", # New project or same, adjust as needed
-        name=run_name,
-        config={
-            "batch_size_rag_e2e": batch_size_rag,
-            "max_epochs_e2e": MAX_EPOCHS_E2E,
-            "patience_e2e": PATIENCE_EPOCHS_E2E,
-            "initial_retriever_model": retriever_model_name,
-            "initial_generator_model": generator_model_name,
-            "optimizer": "AdamW",
-            "top_k_retrieval_inference": top_k_retrieval,
-            "faiss_index_path": FAISS_INDEX_PATH,
-            "metadata_path": METADATA_PATH,
-            "subset_eval_size": SUBSET_EVAL_SIZE,
-        },
-        notes="Single-stage end-to-end RAG fine-tuning with early stopping based on subset evaluation.",
-        resume="allow", id=wandb.util.generate_id()
-    )
-
+def run_evaluation_test():
+    print("--- Starting Standalone Evaluation Test ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device} — {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    if device.type == "cuda":
+        print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+    print(f"Using device: {device}")
 
-    print("Loading training data...")
-    train_data = load_dpr_json(TRAIN_FILE)
-    print("Loading test data...")
-    full_test_data = load_dpr_json(TEST_FILE)
+    BASE_MODEL_SAVE_PATH = "./rag_train_hybrid_v3" 
+    BEST_MODEL_DIR = os.path.join(BASE_MODEL_SAVE_PATH, "best_model")
 
-    subset_test_data_for_epochs = []
-    if full_test_data:
-        if len(full_test_data) > SUBSET_EVAL_SIZE:
-            subset_test_data_for_epochs = full_test_data[:SUBSET_EVAL_SIZE] # Simple slice
-            print(f"Created subset of {len(subset_test_data_for_epochs)} samples for inter-epoch evaluation.")
-        else:
-            subset_test_data_for_epochs = full_test_data
-            print(f"Using all {len(subset_test_data_for_epochs)} test samples for inter-epoch evaluation (full set smaller than subset size).")
-    else:
-        print("No full test data loaded. Inter-epoch and final evaluations will be skipped.")
+    BEST_QUESTION_ENCODER_PATH = os.path.join(BEST_MODEL_DIR, "question_encoder")
+    BEST_GENERATOR_PATH = os.path.join(BEST_MODEL_DIR, "generator")
+    BEST_QE_TOKENIZER_PATH = os.path.join(BEST_MODEL_DIR, "question_tokenizer")
+    BEST_GEN_TOKENIZER_PATH = os.path.join(BEST_MODEL_DIR, "generator_tokenizer")
+    
+    EVAL_DATA_FILE = "downloads/data/gold_passages_info/nq_dev.json" # Or your TEST_FILE
+    SPARSE_EVAL_FILE = "downloads/data/nq_dev_sparse_retrieval.jsonl" # For hybrid retrieval
+    FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_hnsw_index"
+    METADATA_PATH = "/local00/student/shakya/wikipedia_metadata.jsonl"
+    
+    k_dense_for_hybrid = 50
+    k_retrieved_for_generator = 50
 
-    if not train_data:
-        print("No training data loaded. Exiting.")
-        if wandb.run: wandb.finish()
+    MAX_QUESTION_LENGTH = 128
+    MAX_ANSWER_LENGTH = 64 
+    EVAL_BATCH_SIZE = 16
+    MAX_COMBINED_LENGTH_FOR_GEN = 512
+    EVAL_DATA_LIMIT = None
+
+    # 1. Initialize Tokenizers
+    print(f"Loading E5 question tokenizer from: {BEST_QE_TOKENIZER_PATH}")
+    e5_tokenizer = AutoTokenizer.from_pretrained(BEST_QE_TOKENIZER_PATH)
+    print(f"Loading BART generator tokenizer from: {BEST_GEN_TOKENIZER_PATH}")
+    bart_tokenizer = AutoTokenizer.from_pretrained(BEST_GEN_TOKENIZER_PATH)
+    print("Tokenizers initialized.")
+
+    # 2. Initialize Models
+    print(f"Loading E5 Question Encoder: {BEST_QUESTION_ENCODER_PATH}")
+    e5_config = AutoConfig.from_pretrained(BEST_QUESTION_ENCODER_PATH)
+    question_encoder = QuestionEncoder(config=e5_config, model_name_or_path=BEST_QUESTION_ENCODER_PATH).to(device)
+    question_encoder.eval()
+    print("E5 Question Encoder loaded.")
+
+    print(f"Loading BART Generator: {BEST_GENERATOR_PATH}")
+    generator = AutoModelForSeq2SeqLM.from_pretrained(BEST_GENERATOR_PATH).to(device)
+    if hasattr(generator.config, "forced_bos_token_id") and \
+       generator.config.forced_bos_token_id is None and \
+       generator.config.bos_token_id is not None:
+        generator.config.forced_bos_token_id = generator.config.bos_token_id
+        print(f"Set generator.config.forced_bos_token_id to {generator.config.bos_token_id}")
+    print("BART Generator loaded.")
+    
+    # 3. Initialize DenseRetriever
+    print(f"Initializing custom DenseRetriever with E5: {BEST_QUESTION_ENCODER_PATH}")
+    dense_retriever_instance = DenseRetriever(
+        FAISS_INDEX_PATH, METADATA_PATH, device, BEST_QUESTION_ENCODER_PATH,
+        ef_search=1500, ef_construction=200, fine_tune=False)
+    print("DenseRetriever initialized.")
+
+    # 4. Load Evaluation Data
+    print(f"Loading NQ evaluation data from: {EVAL_DATA_FILE}")
+    try:
+        eval_data_list = load_local_nq_json(EVAL_DATA_FILE, limit=EVAL_DATA_LIMIT)
+        if not eval_data_list:
+            print("Evaluation data list is empty. Cannot run evaluation test.")
+            return
+    except Exception as e:
+        print(f"Failed to load evaluation NQ dataset: {e}")
+        traceback.print_exc()
         return
+    
+    eval_sparse_data_lookup = load_precomputed_sparse_results(SPARSE_EVAL_FILE)
+    eval_dataset = NQDataset(eval_data_list, eval_sparse_data_lookup, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
+    eval_dataloader = DataLoader(eval_dataset, batch_size=EVAL_BATCH_SIZE, collate_fn=custom_collate_fn)
+    
+    if len(eval_dataloader) == 0:
+        print("Evaluation DataLoader is empty. Cannot run evaluation test.")
+        return
+    print(f"Evaluation DataLoader created with {len(eval_dataloader)} batches.")
 
-    print(f"Loaded {len(train_data)} training samples and {len(full_test_data)} full test samples.")
-
-
-
-    print(f"\n🚀 Initializing Retriever with: {retriever_model_name}")
-    retriever = DenseRetriever(
-        index_path=FAISS_INDEX_PATH,
-        metadata_path=METADATA_PATH,
-        device=device,
-        model_name=retriever_model_name,
-        passage_tokenizer_name_or_path=generator_model_name,
-        id2row_path="/local00/student/shakya/id2row.json",
-        input_ids_path="/local00/student/shakya/passage_input_ids.dat",
-        attention_mask_path="/local00/student/shakya/passage_attention_mask.dat",
-        num_passages=num_passages,
-        passage_max_len=512,
-        fine_tune=False,
-        ef_search=1500,
-        ef_construction=200,
-    )
-    print(f"\n🚀 Initializing RAG Pipeline with Generator: {generator_model_name}")
-    steps_per_epoch = (len(train_data) + batch_size_rag - 1) // batch_size_rag
-    total_scheduler_steps = steps_per_epoch * MAX_EPOCHS_E2E
-
-    rag_pipeline_instance = RAGPipeline(
-        model_name=generator_model_name,
-        dense_retriever=retriever,
-        device=device,
-        train_generator=True,             
-        train_retriever_end_to_end=True,
-        total_steps_for_scheduler=total_scheduler_steps,
-        k_retrieval_for_inference=top_k_retrieval,
-        retriever_temperature_for_training=1.0
-    )
-
-    # --- Single Training Loop with Early Stopping ---
-    avg_losses_per_epoch_e2e = []
-    subset_eval_scores_e2e = []
-    best_f1_on_subset_e2e = 0.0
-    patience_counter_e2e = 0
-
-    for epoch in range(MAX_EPOCHS_E2E):
-        print(f"\n--- Training Epoch {epoch+1}/{MAX_EPOCHS_E2E} (End-to-End) ---")
-
-        # RAGPipeline.train_pipeline internally loops for the number of epochs it's given.
-        epoch_avg_loss_list = rag_pipeline_instance.train_pipeline(
-            dataset=train_data,
-            batch_size=batch_size_rag,
-            epochs=1,
-            stage_name=f"E2E_Train_Epoch{epoch+1}"
-        )
-        if epoch_avg_loss_list:
-            avg_losses_per_epoch_e2e.append(epoch_avg_loss_list[0])
-
-        current_epoch_subset_f1 = 0.0
-        if subset_test_data_for_epochs:
-            rag_pipeline_instance.generator.eval()
-            if hasattr(rag_pipeline_instance.dense_retriever, 'query_encoder'):
-                rag_pipeline_instance.dense_retriever.query_encoder.eval()
-
-            print(f"Evaluating on SUBSET ({len(subset_test_data_for_epochs)} samples) after E2E Epoch {epoch+1}...")
-            scores_subset = evaluate_pipeline(
-                pipeline=rag_pipeline_instance,
-                test_set=subset_test_data_for_epochs,
-                verbose=False,
-                log_path=os.path.join(CHECKPOINTS_DIR, f"e2e_subset_preds_epoch{epoch+1}.json"),
-                top_k=top_k_retrieval,
-                strategy="thorough",
+    # 5. Optional: Initialize WandB for this test if you want to log
+    global current_wandb_run # Use the global or pass wandb.run object
+    try:
+        import wandb
+        # You might want a different project/name for standalone eval tests
+        final_eval_wandb_run = wandb.init(
+                project="rag-final-evaluation", # Or your preferred project
+                name="final_best_model_nq_dev_run", # Descriptive name
+                reinit=True, # Good for standalone scripts
+                config={
+                    "best_model_source_dir": BEST_MODEL_DIR,
+                    "eval_data_file": EVAL_DATA_FILE,
+                    "sparse_eval_file": SPARSE_EVAL_FILE,
+                    "eval_data_limit": EVAL_DATA_LIMIT,
+                    "k_retrieved_for_generator": k_retrieved_for_generator,
+                    "k_dense_for_hybrid": k_dense_for_hybrid,
+                    "max_q_len": MAX_QUESTION_LENGTH,
+                    "max_a_len": MAX_ANSWER_LENGTH,
+                    "max_combined_len_gen": MAX_COMBINED_LENGTH_FOR_GEN,
+                    "eval_batch_size": EVAL_BATCH_SIZE
+                }
             )
-            subset_eval_scores_e2e.append(scores_subset)
-            current_epoch_subset_f1 = scores_subset.get("F1", 0.0)
-
-            answer_recall = compute_answer_recall(
-                rag_pipeline_instance,
-                subset_test_data_for_epochs,
-                k=top_k_retrieval
-            )
-
-            print(f"Answer-Recall@{top_k_retrieval}: {answer_recall:.2f}%")
-            if wandb.run:
-                wandb.log({f"Answer_Recall@{top_k_retrieval}_Subset": answer_recall})
+        current_wandb_run = final_eval_wandb_run # So evaluate_custom_rag_model can use it
+        print("WandB initialized for evaluation test.")
+    except Exception as e:
+        print(f"Wandb could not be initialized for test: {e}")
+        current_wandb_run = None
 
 
-
-            print(f"Subset Eval (E2E Epoch {epoch+1}) — EM: {scores_subset.get('EM', 0.0):.2f}%, F1: {current_epoch_subset_f1:.2f}%")
-            if wandb.run:
-                wandb.log({
-                    "EM_Subset_Eval_E2E": scores_subset.get("EM", 0.0),
-                    "F1_Subset_Eval_E2E": current_epoch_subset_f1,
-                    "Current_E2E_Epoch": epoch + 1
-                })
-
-            if current_epoch_subset_f1 > best_f1_on_subset_e2e:
-                best_f1_on_subset_e2e = current_epoch_subset_f1
-                patience_counter_e2e = 0
-                print(f"✅ New best F1 on SUBSET: {best_f1_on_subset_e2e:.2f}%. Saving model to {BEST_E2E_MODEL_DIR}...")
-                rag_pipeline_instance.generator.save_pretrained(os.path.join(BEST_E2E_MODEL_DIR, "generator"))
-                rag_pipeline_instance.tokenizer.save_pretrained(os.path.join(BEST_E2E_MODEL_DIR, "generator"))
-                if hasattr(rag_pipeline_instance.dense_retriever, 'save_query_encoder'):
-                    rag_pipeline_instance.dense_retriever.save_query_encoder(os.path.join(BEST_E2E_MODEL_DIR, "retriever_query_encoder"))
-            else:
-                patience_counter_e2e += 1
-                print(f"Subset F1 ({current_epoch_subset_f1:.2f}%) did not improve from best ({best_f1_on_subset_e2e:.2f}%). Patience: {patience_counter_e2e}/{PATIENCE_EPOCHS_E2E}.")
-
-            if patience_counter_e2e >= PATIENCE_EPOCHS_E2E:
-                print(f"Early stopping triggered after E2E Epoch {epoch+1} due to no improvement on subset evaluation.")
-                break # Exit the training loop
-        else:
-            print("No subset test data available, skipping inter-epoch evaluation and early stopping for E2E training.")
-
-    print("\n--- End of E2E Training Phase ---")
-
-
-    # --- FINAL FULL EVALUATION ---
-    print("\n🧪 Performing Final Full Evaluation on the entire test set...")
-    rag_pipeline_instance.generator.eval()
-    if hasattr(rag_pipeline_instance.dense_retriever, 'query_encoder'):
-        rag_pipeline_instance.dense_retriever.query_encoder.eval()
-
-    print(f"Evaluating model on {len(full_test_data)} FULL test samples...")
-    final_full_scores = evaluate_pipeline(
-        pipeline=rag_pipeline_instance,
-        test_set=full_test_data,
-        verbose=True,
-        log_path=os.path.join(CHECKPOINTS_DIR, "final_e2e_FULL_predictions.json"),
-        top_k=top_k_retrieval,
-        strategy="thorough",
+    # 6. Call the evaluation function
+    # Ensure all parameters match the definition in custom_rag_eval.py
+    eval_metrics, logged_samples = evaluate_custom_rag_model(
+        question_encoder_model=question_encoder,
+        dense_retriever=dense_retriever_instance,
+        generator_model=generator,
+        eval_dataloader=eval_dataloader, # This dataloader now yields batches with sparse docs
+        question_tokenizer=e5_tokenizer,
+        generator_tokenizer=bart_tokenizer,
+        k_retrieved=k_retrieved_for_generator, # Final k docs for generator
+        max_combined_length=MAX_COMBINED_LENGTH_FOR_GEN,
+        max_answer_length=MAX_ANSWER_LENGTH,
+        device=device,
+        epoch_num_for_log="final_best_model_eval", # Unique identifier for this run's logs
+        max_logged_examples=100,
+        k_dense_to_fetch_for_hybrid=k_dense_for_hybrid, 
+        wandb_run_obj=current_wandb_run
     )
-    print("\n--- FINAL FULL Evaluation Scores ---")
-    print(f"Exact Match (EM): {final_full_scores.get('EM', 0.0):.2f}%")
-    print(f"F1 Score:         {final_full_scores.get('F1', 0.0):.2f}%")
 
-    if wandb.run:
-        wandb.log({
-            "EM_Final_FULL_TestSet_E2E": final_full_scores.get("EM", 0.0),
-            "F1_Final_FULL_TestSet_E2E": final_full_scores.get("F1", 0.0),
-        })
-    final_scores_path = os.path.join(CHECKPOINTS_DIR, "final_e2e_FULL_evaluation_scores.json")
-    with open(final_scores_path, 'w') as f:
-        json.dump(final_full_scores, f, indent=4)
-    print(f"Final FULL evaluation scores saved to {final_scores_path}")
-
-    if avg_losses_per_epoch_e2e:
-        plt.figure(figsize=(10, 6))
-        epochs_ran = range(1, len(avg_losses_per_epoch_e2e) + 1)
-        plt.plot(epochs_ran, avg_losses_per_epoch_e2e, label='E2E Avg Training Loss per Epoch', marker='o')
-        plt.xlabel("E2E Training Epoch")
-        plt.ylabel("Average Loss")
-        plt.title("E2E RAG Training Loss (Average per Epoch)")
-        plt.legend()
-        plt.xticks(epochs_ran)
-        plt.grid(True)
-        loss_plot_path = os.path.join(CHECKPOINTS_DIR, "training_loss_e2e_epochs.png")
-        plt.savefig(loss_plot_path)
-        if wandb.run: wandb.log({"training_loss_plot_e2e_epochs": wandb.Image(loss_plot_path)})
-        print(f"E2E training loss plot saved to {loss_plot_path}")
-
-    if subset_eval_scores_e2e:
-        f1_scores_plot = [s.get("F1", 0.0) for s in subset_eval_scores_e2e]
-        em_scores_plot = [s.get("EM", 0.0) for s in subset_eval_scores_e2e]
-        epochs_plot = range(1, len(subset_eval_scores_e2e) + 1)
-
-        plt.figure(figsize=(10, 6))
-        plt.plot(epochs_plot, f1_scores_plot, label='F1 Score (E2E on Subset)', marker='o', color='green')
-        plt.plot(epochs_plot, em_scores_plot, label='EM Score (E2E on Subset)', marker='x', color='blue')
-        plt.xlabel("E2E Training Epoch")
-        plt.ylabel("Score (%)")
-        plt.title("E2E Evaluation Scores on Subset Over Epochs")
-        plt.legend()
-        plt.grid(True)
-        plt.xticks(epochs_plot)
-        eval_plot_path = os.path.join(CHECKPOINTS_DIR, "eval_scores_e2e_subset.png")
-        plt.savefig(eval_plot_path)
-        if wandb.run: wandb.log({"evaluation_scores_plot_e2e_subset": wandb.Image(eval_plot_path)})
-        print(f"E2E evaluation scores plot (on subset) saved to {eval_plot_path}")
-
-    if wandb.run:
-        wandb.finish()
-    print("\n--- Main script execution finished ---")
- 
-
+    print("\n--- Standalone Evaluation Test Finished ---")
+    print("Evaluation Metrics:", eval_metrics)
+    if logged_samples:
+        print("\nLogged Samples (first few):")
+        for i, sample in enumerate(logged_samples[:2]): # Print first 2 logged samples
+            print(f"Sample {i+1}: {sample}")
+            
+    if current_wandb_run:
+        if logged_samples: # Log table if samples were generated
+            try:
+                wandb_table = pd.DataFrame(logged_samples)
+                current_wandb_run.log({"evaluation_test_examples": wandb.Table(dataframe=wandb_table)})
+                print("Logged evaluation examples to WandB.")
+            except Exception as e:
+                print(f"Error logging evaluation examples to WandB table: {e}")
+        current_wandb_run.log(eval_metrics) # Log final metrics
+        current_wandb_run.finish()
+        print("WandB run finished.")
 
 if __name__ == "__main__":
-    main()
+    run_evaluation_test()
+

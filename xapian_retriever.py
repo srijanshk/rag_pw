@@ -7,8 +7,8 @@ class XapianRetriever:
         self,
         db_path="wikipedia_xapian_db",
         use_bm25=True,
-        bm25_k1: float = 1.2,
-        bm25_b:  float = 0.75,
+        bm25_k1: float = 1.0,
+        bm25_b:  float = 0.25,
     ):
         """
         db_path   : path to the Xapian database

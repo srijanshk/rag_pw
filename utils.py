@@ -65,10 +65,43 @@ def custom_collate_fn(batch_items: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif isinstance(values[0], str):
             # If the item is a string, keep it as a list of strings
             collated_batch[key] = values
+        elif key == "precomputed_sparse_docs": # Example specific handling
+            collated_batch[key] = values
         else:
             # For other types, just collect them in a list (e.g., int, float)
             # Or handle specifically if needed
             collated_batch[key] = values 
             
     return collated_batch
+
+def load_precomputed_sparse_results(jsonl_file_path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Loads pre-computed sparse retrieval results from a JSONL file into a dictionary.
+    Assumes each line in the JSONL file is a JSON object with at least
+    "example_id" (or "original_question") and "sparse_retrieved_docs".
+    """
+    lookup_dict = {}
+    print(f"Loading pre-computed sparse results from: {jsonl_file_path} ...")
+    try:
+        with open(jsonl_file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f):
+                try:
+                    entry = json.loads(line)
+                    # Use example_id as the key if available and preferred
+                    key = entry.get("example_id") 
+                    if key is None: # Fallback to original_question if example_id is missing
+                        key = entry.get("original_question")
+                    
+                    if key:
+                        lookup_dict[key] = entry.get("sparse_retrieved_docs", [])
+                    else:
+                        print(f"Warning: Missing 'example_id' or 'original_question' key in line {line_num+1} of {jsonl_file_path}")
+                except json.JSONDecodeError:
+                    print(f"Warning: Skipping malformed JSON line {line_num+1} in {jsonl_file_path}")
+        print(f"Loaded {len(lookup_dict)} pre-computed sparse entries from {jsonl_file_path}.")
+    except FileNotFoundError:
+        print(f"Warning: Pre-computed sparse results file not found: {jsonl_file_path}. Sparse results will be empty.")
+    except Exception as e:
+        print(f"Error loading pre-computed sparse results from {jsonl_file_path}: {e}")
+    return lookup_dict
     

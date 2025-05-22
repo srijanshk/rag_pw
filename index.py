@@ -1,7 +1,6 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -20,8 +19,8 @@ from torch.optim import AdamW
 from NqDataset import NQDataset
 from QuestionEncoder import QuestionEncoder
 from DenseRetriever import DenseRetriever
-from RagUtils import calculate_rag_loss, prepare_generator_inputs, retrieve_documents_for_batch
-from utils import load_local_nq_json, custom_collate_fn
+from RagUtils import calculate_rag_loss, hybrid_retrieve_documents_for_batch, prepare_generator_inputs, retrieve_documents_for_batch
+from utils import load_local_nq_json, custom_collate_fn, load_precomputed_sparse_results
 from RagEval import evaluate_custom_rag_model
 
 current_wandb_run = None # Global for wandb run object
@@ -36,30 +35,34 @@ retriever_e5_model_name = "models/retriever_finetuned_e5_best"
 generator_bart_model_name = "best_bart_model"
 TRAIN_FILE = "downloads/data/gold_passages_info/nq_train.json"
 TEST_FILE = "downloads/data/gold_passages_info/nq_dev.json"
+SPARSE_TRAIN_FILE = "downloads/data/nq_train_sparse_retrieval.jsonl"
+SPARSE_TEST_FILE = "downloads/data/nq_dev_sparse_retrieval.jsonl"
 FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_hnsw_index"
 METADATA_PATH = "/local00/student/shakya/wikipedia_metadata.jsonl"
-n_docs_to_retrieve = 5
-n_docs_to_retrieve_eval = 10
+K_SPARSE_PRECOMPUTED = 50
+K_DENSE_RETRIEVAL = 10
+n_docs_to_retrieve = 10
+n_docs_to_retrieve_eval = 50
 NUM_TRAIN_EPOCHS = 10
 LEARNING_RATE = 2e-5
-TRAIN_BATCH_SIZE = 8
-EVAL_BATCH_SIZE = 16
-MODEL_SAVE_PATH = "./rag_custom_trained_final_v3"
+TRAIN_BATCH_SIZE = 4
+EVAL_BATCH_SIZE = 4
+MODEL_SAVE_PATH = "./rag_train_hybrid_v4"
 BEST_MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_PATH, "best_model")
 MAX_QUESTION_LENGTH = 128 
 MAX_ANSWER_LENGTH = 64   
 MAX_COMBINED_LENGTH_FOR_GEN = 512 
 TRAIN_DATA_LIMIT = None
 EVAL_DATA_LIMIT = None
-GRADIENT_ACCUMULATION_STEPS = 6
-EVAL_MAX_LOGGED_EXAMPLES = 3
+GRADIENT_ACCUMULATION_STEPS = 8
+EVAL_MAX_LOGGED_EXAMPLES = 100
 
 # --- Main Function ---
 def main():
     global current_wandb_run
     try:
         wandb.login()
-        run = wandb.init(project="rag-pipeline", config={
+        run = wandb.init(project="rag-pipeline-hybrid", config={
             "lr": LEARNING_RATE, "epochs": NUM_TRAIN_EPOCHS, "train_bs": TRAIN_BATCH_SIZE,
             "eval_bs": EVAL_BATCH_SIZE, "ret_model": retriever_e5_model_name, "gen_model": generator_bart_model_name,
             "max_q": MAX_QUESTION_LENGTH, "max_a": MAX_ANSWER_LENGTH, "max_comb_gen": MAX_COMBINED_LENGTH_FOR_GEN,
@@ -94,6 +97,12 @@ def main():
         print(f"Set generator.config.forced_bos_token_id to {generator.config.bos_token_id}")
     print("BART Generator and Tokenizer loaded.")
 
+    print("Loading pre-computed sparse retrieval data...")
+    try:
+        train_sparse_data_lookup = load_precomputed_sparse_results(SPARSE_TRAIN_FILE)
+        eval_sparse_data_lookup = load_precomputed_sparse_results(SPARSE_TEST_FILE)
+    except Exception as e: return
+
     # Load Data
     print("Loading NQ dataset...")
     try:
@@ -103,8 +112,8 @@ def main():
 
     if not train_data_list: print("Training data list is empty. Exiting."); return
         
-    train_dataset = NQDataset(train_data_list, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
-    eval_dataset = NQDataset(eval_data_list, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
+    train_dataset = NQDataset(train_data_list, train_sparse_data_lookup, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
+    eval_dataset = NQDataset(eval_data_list, eval_sparse_data_lookup, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
     
     train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn)
     eval_dataloader = DataLoader(eval_dataset, batch_size=EVAL_BATCH_SIZE, collate_fn=custom_collate_fn if eval_data_list else None)
@@ -139,15 +148,27 @@ def main():
                 q_attention_mask = batch["attention_mask"].to(device)
                 target_labels = batch["labels"].to(device)
                 original_qs_str = batch["original_question"]
+                batch_precomputed_sparse = batch["precomputed_sparse_docs"] 
 
                 try:
                     query_embeddings = question_encoder(q_input_ids, q_attention_mask)[0]
-                    retrieved = retrieve_documents_for_batch(query_embeddings, dense_retriever, n_docs_to_retrieve, True)
-                    gen_inputs = prepare_generator_inputs(original_qs_str, retrieved["retrieved_doc_titles"],
-                                                          retrieved["retrieved_doc_texts"], bart_tokenizer,
+                    # retrieved = retrieve_documents_for_batch(query_embeddings, dense_retriever, n_docs_to_retrieve, True)
+                    # Perform hybrid retrieval
+                    hybrid_retrieved_info = hybrid_retrieve_documents_for_batch(
+                        query_embeddings_batch=query_embeddings,
+                        batch_precomputed_sparse_docs=batch_precomputed_sparse,
+                        dense_retriever=dense_retriever, # Your DenseRetriever instance
+                        final_k=n_docs_to_retrieve, # Or FINAL_K_FOR_GENERATOR
+                        k_dense_to_fetch=K_DENSE_RETRIEVAL, # How many dense docs to fetch before fusion
+                        # fusion_k_constant can be a default in the function or passed
+                        device=device 
+                    )
+
+                    gen_inputs = prepare_generator_inputs(original_qs_str, hybrid_retrieved_info["retrieved_doc_titles"],
+                                                          hybrid_retrieved_info["retrieved_doc_texts"], bart_tokenizer,
                                                           MAX_COMBINED_LENGTH_FOR_GEN, device)
                     
-                    loss = calculate_rag_loss(query_embeddings, retrieved["retrieved_doc_embeddings"],
+                    loss = calculate_rag_loss(query_embeddings, hybrid_retrieved_info["retrieved_doc_embeddings"],
                                               gen_inputs["generator_input_ids"], gen_inputs["generator_attention_mask"],
                                               target_labels, generator, bart_tokenizer.pad_token_id,
                                               n_docs_to_retrieve, device)
@@ -192,7 +213,7 @@ def main():
                     e5_tokenizer, bart_tokenizer, 
                     n_docs_to_retrieve_eval,
                     MAX_COMBINED_LENGTH_FOR_GEN, MAX_ANSWER_LENGTH, device, str(epoch+1),
-                    EVAL_MAX_LOGGED_EXAMPLES, current_wandb_run
+                    EVAL_MAX_LOGGED_EXAMPLES, 50, current_wandb_run
                 )
                 log_data_epoch.update(eval_metrics)
 
@@ -212,8 +233,11 @@ def main():
                         os.makedirs(BEST_MODEL_SAVE_PATH)
                     question_encoder.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "question_encoder"))
                     generator.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "generator"))
+                    e5_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "question_encoder"))
                     e5_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "question_tokenizer"))
                     bart_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "generator_tokenizer"))
+                    generator.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "bart_generator"))
+                    bart_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "bart_generator"))
                     # Save any other relevant info, like best F1 score itself
                     with open(os.path.join(BEST_MODEL_SAVE_PATH, "best_score.json"), "w") as f:
                         json.dump({"best_f1_score": best_f1_score, "epoch": epoch+1}, f)
@@ -223,50 +247,12 @@ def main():
         if not os.path.exists(MODEL_SAVE_PATH): os.makedirs(MODEL_SAVE_PATH)
         question_encoder.save_pretrained(os.path.join(MODEL_SAVE_PATH, "question_encoder"))
         generator.save_pretrained(os.path.join(MODEL_SAVE_PATH, "generator"))
+        e5_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "question_encoder"))
         e5_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "question_tokenizer"))
         bart_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "generator_tokenizer"))
+        generator.save_pretrained(os.path.join(MODEL_SAVE_PATH, "bart_generator"))
+        bart_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "bart_generator"))
         print(f"RAG components saved to {MODEL_SAVE_PATH}")
-
-    # Inference Example
-    print("\n--- Custom RAG Inference Example ---")
-    question_encoder.eval(); generator.eval()
-    test_question = "What is the Albert Einstein College of Medicine known for?"
-    print(f"Test Question: {test_question}")
-    q_tok_inf = e5_tokenizer(test_question, return_tensors="pt", max_length=MAX_QUESTION_LENGTH, truncation=True).to(device)
-    
-    with torch.no_grad():
-        q_embed_inf = question_encoder(q_tok_inf.input_ids, q_tok_inf.attention_mask)[0]
-        ret_inf = retrieve_documents_for_batch(q_embed_inf, dense_retriever, n_docs_to_retrieve, True)
-        gen_in_inf = prepare_generator_inputs([test_question], ret_inf["retrieved_doc_titles"],
-                                              ret_inf["retrieved_doc_texts"], bart_tokenizer,
-                                              MAX_COMBINED_LENGTH_FOR_GEN, device)
-        
-        if gen_in_inf["generator_input_ids"].numel() > 0:
-            # For inference, select based on doc scores (similar to eval)
-            # This part can be enhanced for better answer selection from n_docs
-            query_embeddings_inf = q_embed_inf
-            retrieved_doc_embeddings_inf = ret_inf["retrieved_doc_embeddings"].to(device)
-            
-            expanded_query_embeddings_inf = query_embeddings_inf.unsqueeze(1)
-            doc_scores_inf = torch.bmm(expanded_query_embeddings_inf, retrieved_doc_embeddings_inf.transpose(1, 2)).squeeze(1)
-            best_doc_idx_inf = torch.argmax(doc_scores_inf, dim=1)[0].item() # Assuming batch size 1 for this simple inference
-
-            input_ids_for_gen = gen_in_inf["generator_input_ids"][best_doc_idx_inf].unsqueeze(0)
-            attention_mask_for_gen = gen_in_inf["generator_attention_mask"][best_doc_idx_inf].unsqueeze(0)
-
-            generated_ids_inf = generator.generate(
-                input_ids=input_ids_for_gen, 
-                attention_mask=attention_mask_for_gen,
-                num_beams=4, max_length=MAX_ANSWER_LENGTH + 20, early_stopping=True,
-                pad_token_id=bart_tokenizer.eos_token_id if bart_tokenizer.eos_token_id is not None else bart_tokenizer.pad_token_id,
-                eos_token_id=bart_tokenizer.eos_token_id,
-                decoder_start_token_id=generator.config.decoder_start_token_id
-            )
-            gen_text_inf = bart_tokenizer.batch_decode(generated_ids_inf, skip_special_tokens=True)
-            print(f"Generated Answer: {gen_text_inf}")
-            print(f"Based on document title: {ret_inf['retrieved_doc_titles'][0][best_doc_idx_inf]}")
-        else:
-            print("No context generated for inference.")
 
     if current_wandb_run: wandb.finish()
 

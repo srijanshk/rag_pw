@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm.auto import tqdm
 import pandas as pd
-from RagUtils import prepare_generator_inputs, retrieve_documents_for_batch
+from RagUtils import hybrid_retrieve_documents_for_batch, prepare_generator_inputs, retrieve_documents_for_batch
 import evaluate
 from typing import List, Dict, Any, Tuple
 
@@ -49,6 +49,7 @@ def evaluate_custom_rag_model(
     device: torch.device,
     epoch_num_for_log="eval",
     max_logged_examples: int = 3, # How many examples to log with retrieved docs
+    K_DENSE_RETRIEVAL: int = 100, # Number of dense retrievals to fetch
     wandb_run_obj = None # Pass the wandb run object for logging
 ) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
 
@@ -71,21 +72,30 @@ def evaluate_custom_rag_model(
             q_attention_mask = batch["attention_mask"].to(device)
             original_question_strings = batch["original_question"] # Expects list of strings
             current_reference_answers = batch["original_answer"]   # Expects list of strings
+            batch_precomputed_sparse_for_eval = batch["precomputed_sparse_docs"]
 
             # 1. Get Query Embeddings
             query_embeddings_tuple = question_encoder_model(input_ids=q_input_ids, attention_mask=q_attention_mask)
             current_query_embeddings = query_embeddings_tuple[0]
 
             # 2. Retrieve Documents 
-            retrieved_info = retrieve_documents_for_batch(
+            # retrieved_info = retrieve_documents_for_batch(
+            #     query_embeddings_batch=current_query_embeddings,
+            #     dense_retriever=dense_retriever,
+            #     k=k_retrieved,
+            #     normalize_query_for_faiss=True # Assuming E5
+            # )
+            hybrid_retrieved_info_eval = hybrid_retrieve_documents_for_batch(
                 query_embeddings_batch=current_query_embeddings,
+                batch_precomputed_sparse_docs=batch_precomputed_sparse_for_eval, # <<< PASS
                 dense_retriever=dense_retriever,
-                k=k_retrieved,
-                normalize_query_for_faiss=True # Assuming E5
+                final_k=k_retrieved, 
+                k_dense_to_fetch=K_DENSE_RETRIEVAL,
+                device=device
             )
-            batch_retrieved_doc_texts = retrieved_info["retrieved_doc_texts"]
-            batch_retrieved_doc_titles = retrieved_info["retrieved_doc_titles"]
-            batch_retrieved_doc_embeddings = retrieved_info["retrieved_doc_embeddings"].to(device)
+            batch_retrieved_doc_texts = hybrid_retrieved_info_eval["retrieved_doc_texts"]
+            batch_retrieved_doc_titles = hybrid_retrieved_info_eval["retrieved_doc_titles"]
+            batch_retrieved_doc_embeddings = hybrid_retrieved_info_eval["retrieved_doc_embeddings"].to(device)
 
             # 3. Prepare Generator Inputs
             generator_inputs = prepare_generator_inputs(
@@ -128,7 +138,7 @@ def evaluate_custom_rag_model(
             all_reference_answers.extend(current_reference_answers)
 
             # Log a few examples with retrieved docs for wandb
-            if wandb_run_obj and logged_examples_count < max_logged_examples and batch_idx == 0:
+            if wandb_run_obj and logged_examples_count < max_logged_examples:
                 for i in range(len(original_question_strings)):
                     if logged_examples_count < max_logged_examples:
                         best_doc_idx_for_log = best_doc_indices[i].item()
