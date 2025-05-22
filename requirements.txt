@@ -18,6 +18,7 @@ datasets==3.5.0
 dill @ file:///croot/dill_1715094664823/work
 docker-pycreds==0.4.0
 docutils==0.21.2
+evaluate==0.4.3
 faiss-cpu==1.10.0
 filelock @ file:///work/perseverance-python-buildout/croot/filelock_1701733993137/work
 fonttools @ file:///croot/fonttools_1737039080035/work
