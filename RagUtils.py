@@ -43,7 +43,6 @@ def retrieve_documents_for_batch(
         faiss.normalize_L2(query_embeddings_np)
 
     # 2. Perform batch FAISS search
-    # `dense_retriever.index` is your loaded FAISS index
     # It returns distances and indices (FAISS IDs)
     distances_batch, faiss_ids_batch = dense_retriever.index.search(query_embeddings_np, k)
     # distances_batch shape: [batch_size, k]
@@ -69,7 +68,6 @@ def retrieve_documents_for_batch(
             if faiss_id == -1: # FAISS can return -1 if fewer than k results are found
                 batch_doc_texts[i].append("")  # Placeholder for missing doc
                 batch_doc_titles[i].append("") # Placeholder for missing title
-                # We will add a placeholder (e.g., zero vector) for its embedding later
                 all_texts_to_embed_flat.append("") # Add empty string to maintain structure for embedding map
                 embedding_map_indices.append((i,j))
             else:
@@ -97,7 +95,6 @@ def retrieve_documents_for_batch(
         # This doc_encoder is a SentenceTransformer model
         dense_retriever.doc_encoder.eval() # Ensure it's in eval mode (it's frozen anyway)
         with torch.no_grad():
-            # Apply prefixes if your doc_encoder (E5) expects them for passages
             prefixed_valid_texts = dense_retriever._apply_model_specific_prefixes(
                 valid_doc_texts_for_encoding, 
                 text_type="passage"
@@ -105,10 +102,9 @@ def retrieve_documents_for_batch(
             doc_embeddings_flat_tensor = dense_retriever.doc_encoder.encode(
                 prefixed_valid_texts,
                 convert_to_tensor=True,
-                # Normalize if your RAG loss expects normalized doc embeddings
                 # For E5, if queries are normalized, docs should be too for dot product.
                 normalize_embeddings=("e5" in dense_retriever.model_name.lower()), 
-                show_progress_bar=False, # Optional
+                show_progress_bar=False,
                 device=dense_retriever.device # Ensure encoding happens on the correct device
             ) # Shape: [num_valid_docs, doc_embed_dim]
 
@@ -189,8 +185,6 @@ def prepare_generator_inputs(
             
             # RAG-style formatting: question <sep> title <sep> passage
             # Using simple textual separators. The generator_tokenizer will handle BOS/EOS.
-            # You might want to experiment with using generator_tokenizer.sep_token if needed,
-            # but often a clear textual separation is fine.
             formatted_string = f"{question_str} [SEP_TITLE] {doc_title} [SEP_TEXT] {doc_text}"
             all_formatted_strings_for_generator.append(formatted_string)
 
@@ -214,7 +208,7 @@ def calculate_rag_loss(
     generator_input_ids: torch.Tensor,         # [batch_size * n_docs, gen_encoder_seq_len]
     generator_attention_mask: torch.Tensor,    # [batch_size * n_docs, gen_encoder_seq_len]
     target_labels: torch.Tensor,               # [batch_size, target_ans_seq_len]
-    generator_model,          # Your BART generator model
+    generator_model,          # BART generator model
     generator_pad_token_id: int,
     n_docs: int,                                # Number of retrieved documents per query
     device: torch.device
@@ -322,7 +316,7 @@ def hybrid_retrieve_documents_for_batch(
     batch_size = query_embeddings_batch.shape[0]
 
     # 1. Perform Online Dense Retrieval (using your existing retrieve_documents_for_batch logic internally)
-    dense_retrieval_results = retrieve_documents_for_batch( # Your existing function
+    dense_retrieval_results = retrieve_documents_for_batch(
         query_embeddings_batch, dense_retriever, k_dense_to_fetch, True
     )
     # dense_retrieval_results is a dict like:
@@ -341,7 +335,7 @@ def hybrid_retrieve_documents_for_batch(
         # --- Fusion Logic (e.g., Reciprocal Rank Fusion - RRF) ---
         # a. Get dense results for current query
         dense_ids = dense_retrieval_results["retrieved_doc_faiss_ids"][i]
-        # Convert dense distances to scores (higher is better, e.g., 1/(1+distance) or use dot product if available)
+        # Convert dense distances to scores (higher is better, e.g., 1/(1+distance) or use dot product
 
         # b. Get sparse results for current query (these are precomputed)
         sparse_docs_for_query_i = batch_precomputed_sparse_docs[i] # List of {"id", "sparse_score", ...}
@@ -376,7 +370,7 @@ def hybrid_retrieve_documents_for_batch(
         }
 
         texts_to_embed_on_the_fly = []
-        indices_for_on_the_fly_embeddings = [] # To place them back correctly
+        indices_for_on_the_fly_embeddings = []
 
         for j, doc_id_str in enumerate(top_final_k_ids_str):
             metadata_entry = dense_retriever.metadata.get(doc_id_str, {})
@@ -408,5 +402,4 @@ def hybrid_retrieve_documents_for_batch(
         "retrieved_doc_texts": final_batch_doc_texts,
         "retrieved_doc_titles": final_batch_doc_titles,
         "retrieved_doc_embeddings": final_batch_doc_embeddings, # Dense embeddings for all final_k docs
-        # You might want to return the fused IDs and their RRF scores too for logging/debugging
     }
