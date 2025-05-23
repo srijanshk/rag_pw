@@ -43,7 +43,6 @@ class NQDataset(Dataset):
         if short_answers_list:
             if isinstance(short_answers_list[0], str):
                 original_answer_str = short_answers_list[0]
-            # Add more sophisticated handling if short_answers can have other structures
 
         if not original_question_str:
             # print(f"Warning: Missing question for entry at index {idx}. Using empty string.")
@@ -67,9 +66,9 @@ class NQDataset(Dataset):
         )
         
         return {
-            "input_ids": question_tokenized.input_ids.squeeze(0), # Remove batch dim
-            "attention_mask": question_tokenized.attention_mask.squeeze(0), # Remove batch dim
-            "labels": labels_tokenized.input_ids.squeeze(0), # Remove batch dim
+            "input_ids": question_tokenized.input_ids.squeeze(0),
+            "attention_mask": question_tokenized.attention_mask.squeeze(0),
+            "labels": labels_tokenized.input_ids.squeeze(0),
             "original_question": original_question_str,
             "original_answer": original_answer_str,
             "precomputed_sparse_docs": precomputed_sparse_docs
