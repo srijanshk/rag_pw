@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Tuple
 
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
-# calculate_metrics function (as defined before)
+# calculate_metrics function
 def calculate_metrics(predictions, references):
     predictions_str = [str(p) if p is not None else "" for p in predictions]
     references_str = [str(r) if r is not None else "" for r in references]
@@ -37,19 +37,19 @@ def calculate_metrics(predictions, references):
 
 def evaluate_custom_rag_model(
     question_encoder_model: PreTrainedModel,
-    dense_retriever, # Forward reference if DenseRetriever is not imported here
+    dense_retriever, 
     generator_model: PreTrainedModel,
-    eval_dataloader: torch.utils.data.DataLoader, # Corrected type hint
+    eval_dataloader: torch.utils.data.DataLoader,
     question_tokenizer: PreTrainedTokenizerFast,
     generator_tokenizer: PreTrainedTokenizerFast,
     k_retrieved: int,
     max_combined_length: int,
-    max_answer_length: int, # Added for generator.generate
+    max_answer_length: int,
     device: torch.device,
     epoch_num_for_log="eval",
-    max_logged_examples: int = 3, # How many examples to log with retrieved docs
-    K_DENSE_RETRIEVAL: int = 100, # Number of dense retrievals to fetch
-    wandb_run_obj = None # Pass the wandb run object for logging
+    max_logged_examples: int = 3, 
+    K_DENSE_RETRIEVAL: int = 100,
+    wandb_run_obj = None 
 ) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
 
     print(f"\nRunning custom RAG evaluation for {epoch_num_for_log}...")
@@ -69,8 +69,8 @@ def evaluate_custom_rag_model(
         for batch_idx, batch in enumerate(tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch_num_for_log}")):
             q_input_ids = batch["input_ids"].to(device)
             q_attention_mask = batch["attention_mask"].to(device)
-            original_question_strings = batch["original_question"] # Expects list of strings
-            current_reference_answers = batch["original_answer"]   # Expects list of strings
+            original_question_strings = batch["original_question"] 
+            current_reference_answers = batch["original_answer"]
             batch_precomputed_sparse_for_eval = batch["precomputed_sparse_docs"]
 
             # 1. Get Query Embeddings
@@ -78,6 +78,7 @@ def evaluate_custom_rag_model(
             current_query_embeddings = query_embeddings_tuple[0]
 
             # 2. Retrieve Documents 
+            # For Dense Only
             # retrieved_info = retrieve_documents_for_batch(
             #     query_embeddings_batch=current_query_embeddings,
             #     dense_retriever=dense_retriever,
