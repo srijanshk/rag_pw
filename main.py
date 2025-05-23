@@ -157,7 +157,7 @@ def main():
                     hybrid_retrieved_info = hybrid_retrieve_documents_for_batch(
                         query_embeddings_batch=query_embeddings,
                         batch_precomputed_sparse_docs=batch_precomputed_sparse,
-                        dense_retriever=dense_retriever, # Your DenseRetriever instance
+                        dense_retriever=dense_retriever, # DenseRetriever instance
                         final_k=n_docs_to_retrieve, # Or FINAL_K_FOR_GENERATOR
                         k_dense_to_fetch=K_DENSE_RETRIEVAL, # How many dense docs to fetch before fusion
                         # fusion_k_constant can be a default in the function or passed
@@ -238,7 +238,7 @@ def main():
                     bart_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "generator_tokenizer"))
                     generator.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "bart_generator"))
                     bart_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "bart_generator"))
-                    # Save any other relevant info, like best F1 score itself
+                    
                     with open(os.path.join(BEST_MODEL_SAVE_PATH, "best_score.json"), "w") as f:
                         json.dump({"best_f1_score": best_f1_score, "epoch": epoch+1}, f)
                     print(f"Best model saved to {BEST_MODEL_SAVE_PATH}")
