@@ -1,6 +1,4 @@
 import os
-# This line is critical: it makes physical GPUs 2 and 3 visible to PyTorch as cuda:0 and cuda:1.
-# It should ideally be set before any CUDA-related libraries (like torch) are imported.
 os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,6,7"
 
 from sentence_transformers import SentenceTransformer, LoggingHandler
@@ -12,8 +10,8 @@ import json
 import logging
 from tqdm import tqdm
 import torch
-import wandb  # for logging
-import math  # for computing total chunks
+import wandb 
+import math  
 
 # Logging setup
 logging.basicConfig(
@@ -32,9 +30,9 @@ CONFIG = {
     "ids_save_path_template": "/local00/student/shakya/wikipedia_embeddings/ids_chunk_{idx}.npy",
     "save_embeddings_and_ids": True,
     "model_name": "models/retriever_finetuned_e5_best",
-    "batch_size": 256,  # Per GPU for encoding. Adjust based on P100 16GB VRAM if OOM.
-    "chunk_size": 1_000_000, # Number of passages to process in one go (affects CPU RAM)
-    "encode_internal_chunk_size": 10000 # Internal chunk_size for model.encode_multi_process
+    "batch_size": 256, 
+    "chunk_size": 1_000_000, 
+    "encode_internal_chunk_size": 10000 
 }
 
 
@@ -101,16 +99,10 @@ def main():
         wandb.finish(exit_code=1)
         return
     
-    # Define target devices for sentence_transformers based on PyTorch's view.
-    # If CUDA_VISIBLE_DEVICES="2,3", PyTorch maps them to "cuda:0" and "cuda:1".
-    # We aim to use up to 2 available GPUs.
+
     num_gpus_to_use = min(num_gpus_torch, 4)
     target_devices_for_pool = [f"cuda:{i}" for i in range(num_gpus_to_use)]
 
-    # if num_gpus_to_use < 2:
-    #     logger.warning(f"Only {num_gpus_to_use} GPU(s) will be used for encoding ({target_devices_for_pool}). Expected 2.")
-    # else:
-    #     logger.info(f"SentenceTransformer will use target devices: {target_devices_for_pool} for encoding (mapping to physical GPUs 2 & 3).")
 
     model = SentenceTransformer(CONFIG["model_name"])
     
