@@ -24,8 +24,9 @@ class DenseRetriever:
                  fine_tune=False,
                  use_fp16: bool = True,
                  ef_search: int = 1500,
-                 ef_construction: int = 200):
+                 ef_construction: int = 200, doc_encoder_model=None):
         self.model_name = model_name
+        self.doc_encoder_model = doc_encoder_model if doc_encoder_model else model_name
         self.fine_tune_enabled = fine_tune
         self.index = faiss.read_index(index_path) # Used for inference/search
 
@@ -57,7 +58,7 @@ class DenseRetriever:
         if hasattr(self.query_encoder, "gradient_checkpointing_enable"):
             self.query_encoder.gradient_checkpointing_enable()
             logger_retriever.info("Gradient checkpointing enabled on query encoder.")
-        self.doc_encoder = SentenceTransformer(model_name).to(device) # Used for on-the-fly encoding
+        self.doc_encoder = SentenceTransformer(doc_encoder_model).to(device)
 
         self._freeze_encoder(self.doc_encoder) # Document encoder typically frozen for RAG retriever tuning
 

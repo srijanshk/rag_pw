@@ -47,7 +47,7 @@ NUM_TRAIN_EPOCHS = 10
 LEARNING_RATE = 2e-5
 TRAIN_BATCH_SIZE = 4
 EVAL_BATCH_SIZE = 4
-MODEL_SAVE_PATH = "./rag_train_hybrid_v4"
+MODEL_SAVE_PATH = "./rag_train_hybrid_v5"
 BEST_MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_PATH, "best_model")
 MAX_QUESTION_LENGTH = 128 
 MAX_ANSWER_LENGTH = 64   
@@ -233,12 +233,10 @@ def main():
                         os.makedirs(BEST_MODEL_SAVE_PATH)
                     question_encoder.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "question_encoder"))
                     generator.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "generator"))
-                    e5_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "question_encoder"))
                     e5_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "question_tokenizer"))
                     bart_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "generator_tokenizer"))
-                    generator.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "bart_generator"))
-                    bart_tokenizer.save_pretrained(os.path.join(BEST_MODEL_SAVE_PATH, "bart_generator"))
-                    
+
+                    # Save any other relevant info, like best F1 score itself
                     with open(os.path.join(BEST_MODEL_SAVE_PATH, "best_score.json"), "w") as f:
                         json.dump({"best_f1_score": best_f1_score, "epoch": epoch+1}, f)
                     print(f"Best model saved to {BEST_MODEL_SAVE_PATH}")
@@ -247,11 +245,8 @@ def main():
         if not os.path.exists(MODEL_SAVE_PATH): os.makedirs(MODEL_SAVE_PATH)
         question_encoder.save_pretrained(os.path.join(MODEL_SAVE_PATH, "question_encoder"))
         generator.save_pretrained(os.path.join(MODEL_SAVE_PATH, "generator"))
-        e5_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "question_encoder"))
         e5_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "question_tokenizer"))
         bart_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "generator_tokenizer"))
-        generator.save_pretrained(os.path.join(MODEL_SAVE_PATH, "bart_generator"))
-        bart_tokenizer.save_pretrained(os.path.join(MODEL_SAVE_PATH, "bart_generator"))
         print(f"RAG components saved to {MODEL_SAVE_PATH}")
 
     if current_wandb_run: wandb.finish()

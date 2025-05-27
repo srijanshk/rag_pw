@@ -2,9 +2,9 @@ import torch
 from transformers import PreTrainedModel, AutoModel, AutoConfig, AutoTokenizer
 
 class QuestionEncoder(PreTrainedModel):
-    def __init__(self, config, model_name_or_path):
-        super().__init__(config) # Pass the E5 model's config to the parent
-        self.e5_model = AutoModel.from_pretrained(model_name_or_path)
+    def __init__(self, config, model_name_or_path: str = None):
+        super().__init__(config)
+        self.e5_model = AutoModel.from_pretrained(model_name_or_path) if model_name_or_path else AutoModel.from_config(config)
         self.config = self.e5_model.config
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, **kwargs):

@@ -38,9 +38,9 @@ def retrieve_documents_for_batch(
     # 1. Prepare query embeddings for FAISS search
     query_embeddings_np = query_embeddings_batch.detach().cpu().numpy()
 
-    if normalize_query_for_faiss and "e5" in dense_retriever.model_name.lower():
-        # FAISS normalize_L2 normalizes in-place
-        faiss.normalize_L2(query_embeddings_np)
+    # if normalize_query_for_faiss and "e5" in dense_retriever.model_name.lower():
+    #     # FAISS normalize_L2 normalizes in-place
+    faiss.normalize_L2(query_embeddings_np)
 
     # 2. Perform batch FAISS search
     # It returns distances and indices (FAISS IDs)

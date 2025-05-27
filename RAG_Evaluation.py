@@ -31,16 +31,14 @@ def run_evaluation_test():
         print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name(torch.cuda.current_device())}")
     print(f"Using device: {device}")
 
-    BASE_MODEL_SAVE_PATH = "./rag_train_hybrid_v3" 
-    BEST_MODEL_DIR = os.path.join(BASE_MODEL_SAVE_PATH, "best_model")
-
-    BEST_QUESTION_ENCODER_PATH = os.path.join(BEST_MODEL_DIR, "question_encoder")
-    BEST_GENERATOR_PATH = os.path.join(BEST_MODEL_DIR, "generator")
-    BEST_QE_TOKENIZER_PATH = os.path.join(BEST_MODEL_DIR, "question_tokenizer")
-    BEST_GEN_TOKENIZER_PATH = os.path.join(BEST_MODEL_DIR, "generator_tokenizer")
+    retriever_e5_model_name = "models/retriever_finetuned_e5_best"
+    question_encoder_path = "rag_train_hybrid_v4/best_model/question_encoder"
+    question_tokenizer_path = "rag_train_hybrid_v4/best_model/question_tokenizer"
+    generator_tokenizer_path = "rag_train_hybrid_v4/best_model/generator_tokenizer"
+    generator_path = "rag_train_hybrid_v4/best_model/bart_generator" 
     
-    EVAL_DATA_FILE = "downloads/data/gold_passages_info/nq_dev.json" # Or your TEST_FILE
-    SPARSE_EVAL_FILE = "downloads/data/nq_dev_sparse_retrieval.jsonl" # For hybrid retrieval
+    EVAL_DATA_FILE = "downloads/data/gold_passages_info/nq_dev.json"
+    SPARSE_EVAL_FILE = "downloads/data/nq_dev_sparse_retrieval.jsonl" 
     FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_hnsw_index"
     METADATA_PATH = "/local00/student/shakya/wikipedia_metadata.jsonl"
     
@@ -49,26 +47,26 @@ def run_evaluation_test():
 
     MAX_QUESTION_LENGTH = 128
     MAX_ANSWER_LENGTH = 64 
-    EVAL_BATCH_SIZE = 16
+    EVAL_BATCH_SIZE = 4
     MAX_COMBINED_LENGTH_FOR_GEN = 512
     EVAL_DATA_LIMIT = None
 
     # 1. Initialize Tokenizers
-    print(f"Loading E5 question tokenizer from: {BEST_QE_TOKENIZER_PATH}")
-    e5_tokenizer = AutoTokenizer.from_pretrained(BEST_QE_TOKENIZER_PATH)
-    print(f"Loading BART generator tokenizer from: {BEST_GEN_TOKENIZER_PATH}")
-    bart_tokenizer = AutoTokenizer.from_pretrained(BEST_GEN_TOKENIZER_PATH)
+    print(f"Loading E5 question tokenizer from: {question_tokenizer_path}")
+    e5_tokenizer = AutoTokenizer.from_pretrained(question_tokenizer_path)
+    print(f"Loading BART generator tokenizer from: {generator_tokenizer_path}")
+    bart_tokenizer = AutoTokenizer.from_pretrained(generator_tokenizer_path)
     print("Tokenizers initialized.")
 
     # 2. Initialize Models
-    print(f"Loading E5 Question Encoder: {BEST_QUESTION_ENCODER_PATH}")
-    e5_config = AutoConfig.from_pretrained(BEST_QUESTION_ENCODER_PATH)
-    question_encoder = QuestionEncoder(config=e5_config, model_name_or_path=BEST_QUESTION_ENCODER_PATH).to(device)
+    print(f"Loading E5 Question Encoder: {question_encoder_path}")
+    e5_config = AutoConfig.from_pretrained(question_encoder_path)
+    question_encoder = QuestionEncoder(config=e5_config).to(device)
     question_encoder.eval()
     print("E5 Question Encoder loaded.")
 
-    print(f"Loading BART Generator: {BEST_GENERATOR_PATH}")
-    generator = AutoModelForSeq2SeqLM.from_pretrained(BEST_GENERATOR_PATH).to(device)
+    print(f"Loading BART Generator: {generator_path}")
+    generator = AutoModelForSeq2SeqLM.from_pretrained(generator_path).to(device)
     if hasattr(generator.config, "forced_bos_token_id") and \
        generator.config.forced_bos_token_id is None and \
        generator.config.bos_token_id is not None:
@@ -77,10 +75,10 @@ def run_evaluation_test():
     print("BART Generator loaded.")
     
     # 3. Initialize DenseRetriever
-    print(f"Initializing custom DenseRetriever with E5: {BEST_QUESTION_ENCODER_PATH}")
+    print(f"Initializing custom DenseRetriever with E5: {retriever_e5_model_name}")
     dense_retriever_instance = DenseRetriever(
-        FAISS_INDEX_PATH, METADATA_PATH, device, BEST_QUESTION_ENCODER_PATH,
-        ef_search=1500, ef_construction=200, fine_tune=False)
+        FAISS_INDEX_PATH, METADATA_PATH, device, retriever_e5_model_name,
+        ef_search=1500, ef_construction=200, fine_tune=False, doc_encoder_model=retriever_e5_model_name)
     print("DenseRetriever initialized.")
 
     # 4. Load Evaluation Data
@@ -114,7 +112,6 @@ def run_evaluation_test():
                 name="final_best_model_nq_dev_run", # Descriptive name
                 reinit=True, # Good for standalone scripts
                 config={
-                    "best_model_source_dir": BEST_MODEL_DIR,
                     "eval_data_file": EVAL_DATA_FILE,
                     "sparse_eval_file": SPARSE_EVAL_FILE,
                     "eval_data_limit": EVAL_DATA_LIMIT,
@@ -148,7 +145,7 @@ def run_evaluation_test():
         device=device,
         epoch_num_for_log="final_best_model_eval", # Unique identifier for this run's logs
         max_logged_examples=100,
-        k_dense_to_fetch_for_hybrid=k_dense_for_hybrid, 
+        K_DENSE_RETRIEVAL=k_dense_for_hybrid, 
         wandb_run_obj=current_wandb_run
     )
 
