@@ -2,7 +2,7 @@ import os
 
 import pandas as pd
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 
 import traceback
 import numpy as np
@@ -18,7 +18,7 @@ from QuestionEncoder import QuestionEncoder
 from DenseRetriever import DenseRetriever
 from RagUtils import calculate_rag_loss, prepare_generator_inputs, retrieve_documents_for_batch
 from utils import load_local_nq_json, custom_collate_fn
-from RagEval import evaluate_custom_rag_model
+from RagEval import evaluate_custom_rag_model, evaluate_dense_rag_model
 
 
 current_wandb_run = None
@@ -547,6 +547,10 @@ def run_evaluation_test():
     # Configuration
     retriever_e5_model_name = "models/retriever_finetuned_e5_best"
     generator_bart_model_name = "best_bart_model" 
+    retriever_tokenizer_path = "rag_train_hybrid_v3/best_model/question_tokenizer"
+    generator_tokenizer_path = "rag_train_hybrid_v3/best_model/generator_tokenizer"
+    retriever_encoder_path = "rag_train_hybrid_v3/best_model/question_encoder"
+    generator_model_path = "rag_train_hybrid_v3/best_model/generator"
     
     EVAL_DATA_FILE = "downloads/data/gold_passages_info/nq_dev.json" 
     FAISS_INDEX_PATH = "/local00/student/shakya/wikipedia_hnsw_index"
@@ -555,25 +559,27 @@ def run_evaluation_test():
     k_retrieved = 10
     MAX_QUESTION_LENGTH = 128
     MAX_ANSWER_LENGTH = 64 
-    EVAL_BATCH_SIZE = 4
+    EVAL_BATCH_SIZE = 8
     MAX_COMBINED_LENGTH_FOR_GEN = 512
     EVAL_DATA_LIMIT = None
 
     # 1. Initialize Tokenizers
-    print(f"Loading E5 question tokenizer from: {retriever_e5_model_name}")
-    e5_tokenizer = AutoTokenizer.from_pretrained(retriever_e5_model_name)
-    print(f"Loading BART generator tokenizer from: {generator_bart_model_name}")
-    bart_tokenizer = AutoTokenizer.from_pretrained(generator_bart_model_name)
+    print(f"Loading E5 question tokenizer from: {retriever_tokenizer_path}")
+    e5_tokenizer = AutoTokenizer.from_pretrained(retriever_tokenizer_path)
+    print(f"Loading BART generator tokenizer from: {generator_tokenizer_path}")
+    bart_tokenizer = AutoTokenizer.from_pretrained(generator_tokenizer_path)
     print("Tokenizers initialized.")
 
     # 2. Initialize Models
-    print(f"Loading E5 Question Encoder: {retriever_e5_model_name}")
-    e5_config = AutoConfig.from_pretrained(retriever_e5_model_name)
-    question_encoder = QuestionEncoder(config=e5_config, model_name_or_path=retriever_e5_model_name).to(device)
+    print(f"Loading E5 Question Encoder: {retriever_encoder_path}")
+    # e5_config = AutoConfig.from_pretrained(retriever_encoder_path)
+    question_encoder = QuestionEncoder.from_pretrained(retriever_encoder_path).to(device)
+    question_encoder.eval() 
+    # question_encoder = QuestionEncoder(config=e5_config).to(device)
     print("E5 Question Encoder loaded.")
 
-    print(f"Loading BART Generator: {generator_bart_model_name}")
-    generator = AutoModelForSeq2SeqLM.from_pretrained(generator_bart_model_name).to(device)
+    print(f"Loading BART Generator: {generator_model_path}")
+    generator = AutoModelForSeq2SeqLM.from_pretrained(generator_model_path).to(device)
     if hasattr(generator.config, "forced_bos_token_id") and \
        generator.config.forced_bos_token_id is None and \
        generator.config.bos_token_id is not None:
@@ -584,8 +590,8 @@ def run_evaluation_test():
     # 3. Initialize DenseRetriever
     print(f"Initializing custom DenseRetriever with E5: {retriever_e5_model_name}")
     dense_retriever_instance = DenseRetriever(
-        FAISS_INDEX_PATH, METADATA_PATH, device, retriever_e5_model_name,
-        ef_search=1500, ef_construction=200, fine_tune=False)
+        FAISS_INDEX_PATH, METADATA_PATH, device, model_name=retriever_e5_model_name,
+        ef_search=1500, ef_construction=200, fine_tune=False, doc_encoder_model=retriever_e5_model_name)
     print("DenseRetriever initialized.")
 
     # 4. Load Evaluation Data
@@ -600,7 +606,7 @@ def run_evaluation_test():
         traceback.print_exc()
         return
         
-    eval_dataset = NQDataset(eval_data_list, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
+    eval_dataset = NQDataset(eval_data_list, None, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
     eval_dataloader = DataLoader(eval_dataset, batch_size=EVAL_BATCH_SIZE, collate_fn=custom_collate_fn)
     
     if len(eval_dataloader) == 0:
@@ -627,7 +633,7 @@ def run_evaluation_test():
 
     # 6. Call the evaluation function
     # Ensure all parameters match the definition in custom_rag_eval.py
-    eval_metrics, logged_samples = evaluate_custom_rag_model(
+    eval_metrics, logged_samples = evaluate_dense_rag_model(
         question_encoder_model=question_encoder,
         dense_retriever=dense_retriever_instance,
         generator_model=generator,

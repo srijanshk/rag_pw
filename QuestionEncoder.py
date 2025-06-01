@@ -2,10 +2,13 @@ import torch
 from transformers import PreTrainedModel, AutoModel, AutoConfig, AutoTokenizer
 
 class QuestionEncoder(PreTrainedModel):
+    config_class = AutoConfig
+
     def __init__(self, config, model_name_or_path: str = None):
         super().__init__(config)
-        self.e5_model = AutoModel.from_pretrained(model_name_or_path) if model_name_or_path else AutoModel.from_config(config)
-        self.config = self.e5_model.config
+        self.e5_model = AutoModel.from_config(config=config) 
+        # self.e5_model = AutoModel.from_pretrained(model_name_or_path) if model_name_or_path else AutoModel.from_config(config)
+        # self.config = self.e5_model.config
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, **kwargs):
         model_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}

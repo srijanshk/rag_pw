@@ -38,7 +38,12 @@ class NQDataset(Dataset):
         short_answers_list = entry.get("short_answers", [])
         # Ensure short_answers_list contains strings, take the first one
 
-        precomputed_sparse_docs = self.sparse_retrieval_data.get(original_question_str, [])
+        if self.sparse_retrieval_data is None:
+            # If no sparse retrieval data is provided, use an empty list
+            precomputed_sparse_docs = []
+        else:
+            precomputed_sparse_docs =  self.sparse_retrieval_data.get(original_question_str, [])
+
         original_answer_str = ""
         if short_answers_list:
             if isinstance(short_answers_list[0], str):

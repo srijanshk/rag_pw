@@ -21,6 +21,7 @@ from utils import load_local_nq_json, custom_collate_fn, load_precomputed_sparse
 from RagUtils import prepare_generator_inputs
 
 from RagEval import calculate_metrics
+from QuestionEncoder import QuestionEncoder
 
 
 def evaluate_sparse_rag_pipeline(
@@ -185,8 +186,10 @@ def run_sparse_rag_evaluation_test():
         "max_question_length_for_dataset": 128,
         "max_answer_length_for_dataset": 64,
     }
-    generator_path = "best_bart_model" 
-    encoder_path = "models/retriever_finetuned_e5_best"
+    generator_path = "rag_train_hybrid_v4/best_model/generator"
+    generator_tokenizer_path = "rag_train_hybrid_v4/best_model/generator_tokenizer"
+    question_encoder_path = "rag_train_hybrid_v4/best_model/question_encoder"
+    question_tokenizer_path = "rag_train_hybrid_v4/best_model/question_tokenizer"
     EVAL_BATCH_SIZE = 4
     MAX_QUESTION_LENGTH = CONFIG["max_question_length_for_dataset"]
     MAX_ANSWER_LENGTH = CONFIG["max_answer_length_for_dataset"]
@@ -198,8 +201,10 @@ def run_sparse_rag_evaluation_test():
     print(f"Using device: {device}")
     
     # 1. Load BART Generator and Tokenizer
-    print(f"Loading BART generator tokenizer from: {generator_path}")
-    bart_tokenizer = AutoTokenizer.from_pretrained(generator_path)
+    print(f"Loading E5 question tokenizer from: {question_tokenizer_path}")
+    e5_tokenizer = AutoTokenizer.from_pretrained(question_tokenizer_path)
+    print(f"Loading BART generator tokenizer from: {generator_tokenizer_path}")
+    bart_tokenizer = AutoTokenizer.from_pretrained(generator_tokenizer_path)
     print(f"Loading BART Generator: {generator_path}")
     generator = AutoModelForSeq2SeqLM.from_pretrained(generator_path).to(device)
     # Set BOS token if needed for BART
@@ -218,15 +223,18 @@ def run_sparse_rag_evaluation_test():
 
     if not eval_data_list: print("Evaluation data list is empty."); return
         
-    dummy_q_tokenizer_for_dataset = AutoTokenizer.from_pretrained(encoder_path)
+    print(f"Loading E5 Question Encoder: {question_encoder_path}")
+    question_encoder = QuestionEncoder.from_pretrained(question_encoder_path).to(device)
+    question_encoder.eval() 
+    print("E5 Question Encoder loaded.")
 
     eval_dataset = NQDataset(
         eval_data_list, 
-        eval_sparse_data_lookup, # Pass the loaded sparse data
-        question_tokenizer=dummy_q_tokenizer_for_dataset, # Or your actual E5 tokenizer
+        eval_sparse_data_lookup,
+        question_tokenizer=e5_tokenizer, 
         generator_tokenizer=bart_tokenizer, 
-        max_question_length=MAX_QUESTION_LENGTH, # From CONFIG
-        max_answer_length=MAX_ANSWER_LENGTH    # From CONFIG
+        max_question_length=MAX_QUESTION_LENGTH, 
+        max_answer_length=MAX_ANSWER_LENGTH 
     )
     eval_dataloader = DataLoader(eval_dataset, batch_size=EVAL_BATCH_SIZE, collate_fn=custom_collate_fn)
     if len(eval_dataloader) == 0: print("Evaluation DataLoader is empty."); return

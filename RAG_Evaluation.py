@@ -60,9 +60,8 @@ def run_evaluation_test():
 
     # 2. Initialize Models
     print(f"Loading E5 Question Encoder: {question_encoder_path}")
-    e5_config = AutoConfig.from_pretrained(question_encoder_path)
-    question_encoder = QuestionEncoder(config=e5_config).to(device)
-    question_encoder.eval()
+    question_encoder = QuestionEncoder.from_pretrained(question_encoder_path).to(device)
+    question_encoder.eval() 
     print("E5 Question Encoder loaded.")
 
     print(f"Loading BART Generator: {generator_path}")
