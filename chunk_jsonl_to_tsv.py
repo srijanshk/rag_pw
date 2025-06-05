@@ -5,7 +5,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import json
 import re
-from multiprocessing import Pool, cpu_count, get_context
+from multiprocessing import Pool, cpu_count
 import spacy
 import torch
 from sentence_transformers import SentenceTransformer, util
@@ -214,27 +214,29 @@ if __name__ == "__main__":
 
         f_out.write("row_id\tchunk_id\tproblem\tsolution_chunk\tsolution\tproblem_from\n")
 
-        ctx = get_context("spawn")
-        with ctx.Pool(processes=NUM_WORKERS, initializer=worker_init) as pool:
-            batch = []
-            for line_idx, line in enumerate(f_in):
-                batch.append((line_idx, line))
-                if len(batch) >= BATCH_SIZE:
-                    for res_lines in pool.imap_unordered(process_json_record, batch):
-                        for out_line in res_lines:
-                            f_out.write(out_line)
-                        total_chunks += len(res_lines)
-                    total_records += len(batch)
-                    if total_records % 500 == 0:
-                        print(f"Processed {total_records} records, generated ~{total_chunks} chunks...")
-                    batch = []
-
-            if batch:
+        pool = Pool(processes=NUM_WORKERS, initializer=worker_init)
+        batch = []
+        for line_idx, line in enumerate(f_in):
+            batch.append((line_idx, line))
+            if len(batch) >= BATCH_SIZE:
                 for res_lines in pool.imap_unordered(process_json_record, batch):
                     for out_line in res_lines:
                         f_out.write(out_line)
                     total_chunks += len(res_lines)
                 total_records += len(batch)
+                if total_records % 500 == 0:
+                    print(f"Processed {total_records} records, generated ~{total_chunks} chunks...")
+                batch = []
+
+        if batch:
+            for res_lines in pool.imap_unordered(process_json_record, batch):
+                for out_line in res_lines:
+                    f_out.write(out_line)
+                total_chunks += len(res_lines)
+            total_records += len(batch)
+
+        pool.close()
+        pool.join()
 
     print(f"\nFinished! Total records processed: {total_records}")
     print(f"Total chunks written: {total_chunks}")
