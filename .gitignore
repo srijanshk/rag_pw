@@ -34,3 +34,7 @@ rag_train_hybrid_v4/*
 *.log
 *.tmp
 wandb/
+
+baseline_results/*
+thesis_datasets/*
+
