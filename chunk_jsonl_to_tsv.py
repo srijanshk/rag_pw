@@ -1,10 +1,11 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 import json
 import re
+from multiprocessing import Pool, cpu_count
 import spacy
 import torch
 from sentence_transformers import SentenceTransformer, util
@@ -33,13 +34,24 @@ MAX_SENTENCES_BEFORE_CHECK = 6
 # 3) Cosine‐similarity threshold: if sim < this between adjacent sentences, split
 SIM_THRESHOLD = 0.82
 
-# 4) Load spaCy (on CPU) and SentenceTransformer (on DEVICE)
-print("Loading spaCy model (en_core_web_sm) on CPU...")
-nlp = spacy.load("en_core_web_sm")
+# 4) Multiprocessing configuration
+NUM_WORKERS = max(1, cpu_count() - 1)
+BATCH_SIZE = 100
 
-print(f"Loading SentenceTransformer (intfloat/e5-large-v2) on {DEVICE}...")
-# By passing device=DEVICE, embeddings will run on GPU if DEVICE=="cuda"
-embedder = SentenceTransformer("intfloat/e5-large-v2", device=DEVICE)
+# Placeholders for per-process models (set in worker_init)
+nlp = None
+embedder = None
+
+
+def worker_init():
+    """Initialize models inside each worker process."""
+    global nlp, embedder
+    if nlp is None:
+        print("Loading spaCy model (en_core_web_sm) in worker...")
+        nlp = spacy.load("en_core_web_sm")
+    if embedder is None:
+        print(f"Loading SentenceTransformer (intfloat/e5-large-v2) on {DEVICE} in worker...")
+        embedder = SentenceTransformer("intfloat/e5-large-v2", device=DEVICE)
 
 
 # ── Helper Functions ─────────────────────────────────────────────────────────────
@@ -49,6 +61,9 @@ def _split_into_sentences(text: str) -> list[str]:
     Splits the input text into a list of sentence strings using spaCy.
     Filters out any empty sentences.
     """
+    global nlp
+    if nlp is None:
+        worker_init()
     doc = nlp(text)
     return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
 
@@ -59,13 +74,15 @@ def embed_sentences(sent_list: list[str]) -> torch.Tensor:
     Each sentence is prefixed with "passage:" before encoding.
     Embeddings live on DEVICE (GPU if available).
     """
+    global embedder
+    if embedder is None:
+        worker_init()
     inputs = [f"passage: {s}" for s in sent_list]
-    # Use convert_to_tensor=True so that encode returns a torch.Tensor on DEVICE
     embeddings: torch.Tensor = embedder.encode(
         inputs,
         batch_size=32,
         normalize_embeddings=True,
-        convert_to_tensor=True
+        convert_to_tensor=True,
     )
     # embeddings.shape == (len(sent_list), embedding_dim)
     return embeddings  # already on DEVICE
@@ -145,6 +162,44 @@ def semantic_chunks(text: str,
     return chunks
 
 
+def process_json_record(args) -> list[str]:
+    """Worker function to process a single JSONL line."""
+    line_idx, line = args
+    line = line.strip()
+    if not line:
+        return []
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+
+    row_id = line_idx
+    problem_text = record.get("problem", "")
+    solution_full = (
+        record.get("generated_solution")
+        or record.get("solution")
+        or record.get("output")
+        or ""
+    )
+    problem_source = record.get("problem_from", "")
+
+    if not solution_full or not isinstance(solution_full, str):
+        return []
+
+    chunks = semantic_chunks(solution_full)
+    out_lines = []
+    for chunk_id, chunk_text in enumerate(chunks):
+        clean_problem = problem_text.replace("\t", " ").replace("\n", " ").strip()
+        clean_chunk = chunk_text.replace("\t", " ").replace("\n", " ").strip()
+        clean_solution_full = solution_full.replace("\t", " ").replace("\n", " ").strip()
+        clean_problem_src = problem_source.replace("\t", " ").replace("\n", " ").strip()
+        out_lines.append(
+            f"{row_id}\t{chunk_id}\t{clean_problem}\t{clean_chunk}\t{clean_solution_full}\t{clean_problem_src}\n"
+        )
+
+    return out_lines
+
+
 # ── Main Processing ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -154,56 +209,34 @@ if __name__ == "__main__":
     total_records = 0
     total_chunks = 0
 
-    # Open the input JSONL and output TSV
     with open(INPUT_JSONL_FILE, "r", encoding="utf-8") as f_in, \
          open(OUTPUT_TSV_FILE, "w", encoding="utf-8") as f_out:
 
-        # Write a header row with the specified columns
         f_out.write("row_id\tchunk_id\tproblem\tsolution_chunk\tsolution\tproblem_from\n")
 
+        pool = Pool(processes=NUM_WORKERS, initializer=worker_init)
+        batch = []
         for line_idx, line in enumerate(f_in):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                print(f"Warning: Skipping invalid JSON on line {line_idx+1}")
-                continue
+            batch.append((line_idx, line))
+            if len(batch) >= BATCH_SIZE:
+                for res_lines in pool.imap_unordered(process_json_record, batch):
+                    for out_line in res_lines:
+                        f_out.write(out_line)
+                    total_chunks += len(res_lines)
+                total_records += len(batch)
+                if total_records % 500 == 0:
+                    print(f"Processed {total_records} records, generated ~{total_chunks} chunks...")
+                batch = []
 
-            total_records += 1
-            row_id = line_idx  # use the zero-based line index as row_id
+        if batch:
+            for res_lines in pool.imap_unordered(process_json_record, batch):
+                for out_line in res_lines:
+                    f_out.write(out_line)
+                total_chunks += len(res_lines)
+            total_records += len(batch)
 
-            # Extract fields from the JSON record. Adjust keys if needed.
-            problem_text    = record.get("problem", "")
-            solution_full   = record.get("generated_solution") or record.get("solution") or record.get("output") or ""
-            problem_source  = record.get("problem_from", "")
-
-            # Skip if there's no solution to chunk
-            if not solution_full or not isinstance(solution_full, str):
-                continue
-
-            # Perform semantic chunking on the full solution text
-            chunks = semantic_chunks(solution_full)
-            for chunk_id, chunk_text in enumerate(chunks):
-                # Clean any tabs or newlines to preserve TSV format
-                clean_problem       = problem_text.replace("\t", " ").replace("\n", " ").strip()
-                clean_chunk         = chunk_text.replace("\t", " ").replace("\n", " ").strip()
-                clean_solution_full = solution_full.replace("\t", " ").replace("\n", " ").strip()
-                clean_problem_src   = problem_source.replace("\t", " ").replace("\n", " ").strip()
-
-                f_out.write(
-                    f"{row_id}\t{chunk_id}\t"
-                    f"{clean_problem}\t"
-                    f"{clean_chunk}\t"
-                    f"{clean_solution_full}\t"
-                    f"{clean_problem_src}\n"
-                )
-                total_chunks += 1
-
-            # Progress indicator every 500 records
-            if total_records % 500 == 0:
-                print(f"Processed {total_records} records, generated ~{total_chunks} chunks...")
+        pool.close()
+        pool.join()
 
     print(f"\nFinished! Total records processed: {total_records}")
     print(f"Total chunks written: {total_chunks}")
