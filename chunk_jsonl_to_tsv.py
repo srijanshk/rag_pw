@@ -1,241 +1,319 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-
 import json
 import re
-from multiprocessing import Pool, cpu_count, get_context
 import spacy
 import torch
-from sentence_transformers import SentenceTransformer, util
+from tqdm import tqdm
+import csv
+import logging
+from multiprocessing import Pool, get_context
+from FlagEmbedding import BGEM3FlagModel
+from itertools import islice
+import time
 
-# ── CUDA / Device Configuration ───────────────────────────────────────────────────
-# Check if a CUDA GPU is available; otherwise fall back to CPU.
-if torch.cuda.is_available():
-    DEVICE = "cuda"
-    print(f"CUDA is available. Using device: {DEVICE}")
-else:
-    DEVICE = "cpu"
-    print("CUDA not available. Falling back to CPU.")
+# --- Setup ---
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4" 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# ── Configuration ────────────────────────────────────────────────────────────────
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] - %(message)s",
+    handlers=[
+        logging.FileHandler("processing.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Input and output paths
+# --- Configuration ---
 INPUT_JSONL_FILE = "./thesis_datasets/openmathinstruct2/openmathinstruct2_train_streamed.jsonl"
-OUTPUT_TSV_FILE  = "./thesis_datasets/openmathinstruct2/openmath_chunked_for_indexing.tsv"
+OUTPUT_TSV_FILE = "./thesis_datasets/openmathinstruct2/openmath_chunked_for_indexing_bge-m3.tsv"
+TEMP_OUTPUT_FILE = OUTPUT_TSV_FILE + ".temp"
 
-# 1) Regex markers for hard structural breaks in solutions
+# Chunking Parameters
+MAX_SENTENCES_BEFORE_CHECK = 6
+SIM_THRESHOLD = 0.85 
+
+# Processing Configuration
+NUM_CPU_WORKERS = max(1, os.cpu_count() - 2)  # Leave 2 CPUs for main process and GPU operations
+PROCESSING_BATCH_SIZE = 50000  # Records per batch
+EMBEDDING_BATCH_SIZE = 1024   # Optimal batch size for BGE-M3
+CHECKPOINT_INTERVAL = 100000  # Save progress every 100K records
+MAX_RECORDS_IN_MEMORY = 50000 # Process in memory chunks
+
+# Regex for hard breaks
 STEP_REGEX = re.compile(r"^(?:#+\s|Step\s*\d+|Therefore|Hence|Thus\b|Finally\b)", re.I)
 
-# 2) Maximum number of sentences before triggering a semantic‐drift check
-MAX_SENTENCES_BEFORE_CHECK = 6
-
-# 3) Cosine‐similarity threshold: if sim < this between adjacent sentences, split
-SIM_THRESHOLD = 0.82
-
-# 4) Multiprocessing configuration
-NUM_WORKERS = max(1, cpu_count() - 1)
-BATCH_SIZE = 100
-
-# Placeholders for per-process models (set in worker_init)
+# Global for CPU worker processes
 nlp = None
-embedder = None
 
-
-def worker_init():
-    """Initialize models inside each worker process."""
-    global nlp, embedder
-    if nlp is None:
-        print("Loading spaCy model (en_core_web_sm) in worker...")
-        nlp = spacy.load("en_core_web_sm")
-    if embedder is None:
-        print(f"Loading SentenceTransformer (intfloat/e5-large-v2) on {DEVICE} in worker...")
-        embedder = SentenceTransformer("intfloat/e5-large-v2", device=DEVICE)
-
-
-# ── Helper Functions ─────────────────────────────────────────────────────────────
-
-def _split_into_sentences(text: str) -> list[str]:
-    """
-    Splits the input text into a list of sentence strings using spaCy.
-    Filters out any empty sentences.
-    """
+def worker_init_cpu():
+    """Initializes spaCy in each CPU worker process."""
     global nlp
     if nlp is None:
-        worker_init()
-    doc = nlp(text)
-    return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+        nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "lemmatizer"])
+        nlp.add_pipe('sentencizer')  # Ensure sentence boundary detection
 
-
-def embed_sentences(sent_list: list[str]) -> torch.Tensor:
-    """
-    Given a list of sentence strings, returns a torch.Tensor of normalized embeddings.
-    Each sentence is prefixed with "passage:" before encoding.
-    Embeddings live on DEVICE (GPU if available).
-    """
-    global embedder
-    if embedder is None:
-        worker_init()
-    inputs = [f"passage: {s}" for s in sent_list]
-    embeddings: torch.Tensor = embedder.encode(
-        inputs,
-        batch_size=32,
-        normalize_embeddings=True,
-        convert_to_tensor=True,
-    )
-    # embeddings.shape == (len(sent_list), embedding_dim)
-    return embeddings  # already on DEVICE
-
-
-def semantic_chunks(text: str,
-                    max_sentences: int = MAX_SENTENCES_BEFORE_CHECK,
-                    sim_threshold: float = SIM_THRESHOLD) -> list[str]:
-    """
-    Splits `text` (a long solution string) into semantically coherent chunks,
-    using spaCy for sentences and E5 embeddings (on DEVICE) for drift detection.
-
-    Algorithm:
-      1) Sentence‐tokenize the text with spaCy.
-      2) Pre‐compute embeddings for every sentence (on GPU if available).
-      3) Iterate sentence by sentence, accumulating a current chunk.
-         a) If a sentence matches STEP_REGEX and the current chunk is nonempty,
-            flush the chunk (start a new one).
-         b) Otherwise, add the sentence to the current chunk.
-         c) Once the chunk reaches `max_sentences` sentences, compare the embedding
-            of the last sentence in the chunk to the embedding of the next sentence
-            in the full text. If cosine similarity < sim_threshold, flush the chunk.
-      4) At the end, flush any remaining sentences as a final chunk.
-
-    Returns:
-      List[str]: Each element is a single chunk (joined sentences) as a string.
-    """
-    # 1) Split text into sentences
-    sentences = _split_into_sentences(text)
-    if not sentences:
-        return []
-
-    # 2) Embed all sentences once (on GPU if available)
-    sentence_embeddings: torch.Tensor = embed_sentences(sentences)
-    # shape: (num_sentences, hidden_dim)
-
-    chunks: list[str] = []
-    cur_chunk_sentences: list[str] = []
-    cur_chunk_indices: list[int] = []
-
-    def flush_current_chunk():
-        """Joins current chunk sentences into one string, appends to chunks, clears buffers."""
-        if not cur_chunk_sentences:
-            return
-        joined = " ".join(cur_chunk_sentences).replace("\n", " ").strip()
-        if joined:
-            chunks.append(joined)
-        cur_chunk_sentences.clear()
-        cur_chunk_indices.clear()
-
-    # 3) Iterate through sentences
-    for idx, sentence in enumerate(sentences):
-        # (a) Hard marker break
-        if STEP_REGEX.match(sentence) and cur_chunk_sentences:
-            flush_current_chunk()
-            cur_chunk_sentences.append(sentence)
-            cur_chunk_indices.append(idx)
-            continue
-
-        # (b) Otherwise, accumulate
-        cur_chunk_sentences.append(sentence)
-        cur_chunk_indices.append(idx)
-
-        # (c) Check semantic drift if max_sentences is reached
-        if len(cur_chunk_sentences) >= max_sentences:
-            next_idx = idx + 1
-            if next_idx < len(sentences):
-                emb_last = sentence_embeddings[idx].unsqueeze(0)   # shape: (1, hidden_dim)
-                emb_next = sentence_embeddings[next_idx].unsqueeze(0)  # shape: (1, hidden_dim)
-                cosine_sim = util.pytorch_cos_sim(emb_last, emb_next).item()
-                if cosine_sim < sim_threshold:
-                    flush_current_chunk()
-                # else: keep adding to same chunk until next check
-
-    # 4) Flush any remainder
-    flush_current_chunk()
-    return chunks
-
-
-def process_json_record(args) -> list[str]:
-    """Worker function to process a single JSONL line."""
-    line_idx, line = args
+def process_record_cpu_part(line_and_idx):
+    """Worker function that takes (line, line_idx) tuple."""
+    line, line_idx = line_and_idx
     line = line.strip()
-    if not line:
-        return []
+    if not line: 
+        return None
+    
     try:
         record = json.loads(line)
     except json.JSONDecodeError:
-        return []
+        return None
 
-    row_id = line_idx
-    problem_text = record.get("problem", "")
-    solution_full = (
-        record.get("generated_solution")
-        or record.get("solution")
-        or record.get("output")
-        or ""
-    )
-    problem_source = record.get("problem_from", "")
+    solution_full = record.get("generated_solution") or record.get("solution", "")
+    if not solution_full or not isinstance(solution_full, str): 
+        return None
+    
+    # Fast sentence splitting with minimal processing
+    try:
+        doc = nlp(solution_full)
+        sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+    except Exception as e:
+        logger.warning(f"Sentence splitting failed: {e}")
+        sentences = [solution_full]  # Fallback to whole text
+    
+    if not sentences:
+        return None
+        
+    return {
+        "problem": record.get("problem", ""),
+        "sentences": sentences,
+        "expected_answer": record.get("expected_answer", ""),
+        "problem_source": record.get("problem_source", ""),
+        "line_idx": line_idx  # Use the provided line index
+    }
 
-    if not solution_full or not isinstance(solution_full, str):
-        return []
+def sanitize_for_tsv(text: str) -> str:
+    """Replaces characters that interfere with TSV formatting."""
+    if not isinstance(text, str): 
+        return ""
+    return ' '.join(text.replace('\t', ' ').replace('\n', ' ').split())
 
-    chunks = semantic_chunks(solution_full)
-    out_lines = []
-    for chunk_id, chunk_text in enumerate(chunks):
-        clean_problem = problem_text.replace("\t", " ").replace("\n", " ").strip()
-        clean_chunk = chunk_text.replace("\t", " ").replace("\n", " ").strip()
-        clean_solution_full = solution_full.replace("\t", " ").replace("\n", " ").strip()
-        clean_problem_src = problem_source.replace("\t", " ").replace("\n", " ").strip()
-        out_lines.append(
-            f"{row_id}\t{chunk_id}\t{clean_problem}\t{clean_chunk}\t{clean_solution_full}\t{clean_problem_src}\n"
+def batch_generator(iterable, batch_size):
+    """Yield batches with line numbers."""
+    iterator = enumerate(iterable)  # Keep track of line numbers
+    while True:
+        batch = list(islice(iterator, batch_size))
+        if not batch:
+            break
+        # Separate lines and indices
+        indices, lines = zip(*batch)
+        yield (lines, indices)
+
+def process_batch(embedder, batch_records):
+    """Process a batch of records with GPU acceleration."""
+    all_sentences = []
+    record_indices = []
+    
+    # Prepare batch data
+    for i, record in enumerate(batch_records):
+        if record and record["sentences"]:
+            all_sentences.extend(record["sentences"])
+            record_indices.extend([i] * len(record["sentences"]))
+    
+    if not all_sentences:
+        return batch_records
+    
+    # Batch process embeddings
+    try:
+        embedding_dict = embedder.encode(
+            all_sentences, 
+            batch_size=EMBEDDING_BATCH_SIZE, 
+            max_length=512,
+            return_dense=True, 
+            return_sparse=False, 
+            return_colbert_vecs=False
         )
+        
+        # Normalize embeddings
+        sentence_embeddings = torch.nn.functional.normalize(
+            torch.from_numpy(embedding_dict['dense_vecs']), p=2, dim=1
+        )
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
+        return batch_records
+    
+    # Reconstruct records with embeddings
+    embedding_ptr = 0
+    for record in batch_records:
+        if not record or not record["sentences"]:
+            continue
+            
+        num_sentences = len(record["sentences"])
+        record["embeddings"] = sentence_embeddings[embedding_ptr:embedding_ptr+num_sentences]
+        embedding_ptr += num_sentences
+        
+    return batch_records
 
-    return out_lines
+def chunk_sentences(record):
+    """Chunk sentences based on embeddings and rules."""
+    if not record or not record["sentences"]:
+        return []
+        
+    embeddings = record.get("embeddings", None)
+    if embeddings is None:
+        return [" ".join(record["sentences"])]  # Fallback if no embeddings
+        
+    chunks, cur_chunk = [], []
+    
+    for i, (sentence, embedding) in enumerate(zip(record["sentences"], embeddings)):
+        if STEP_REGEX.match(sentence) and cur_chunk:
+            chunks.append(" ".join(cur_chunk))
+            cur_chunk = []
+            
+        if len(cur_chunk) >= MAX_SENTENCES_BEFORE_CHECK and i + 1 < len(record["sentences"]):
+            try:
+                sim = torch.dot(embedding, embeddings[i+1]).item()
+                if sim < SIM_THRESHOLD:
+                    chunks.append(" ".join(cur_chunk))
+                    cur_chunk = []
+            except Exception:
+                pass
+                
+        cur_chunk.append(sentence)
+        
+    if cur_chunk:
+        chunks.append(" ".join(cur_chunk))
+        
+    return chunks
 
+def count_lines(filename):
+    """Count lines in a file efficiently."""
+    with open(filename, 'r', encoding='utf-8') as f:
+        return sum(1 for _ in f)
 
-# ── Main Processing ──────────────────────────────────────────────────────────────
+def process_batches(embedder, pool, batch_iterator, total_lines, output_file):
+    """Process batches with checkpointing and progress tracking."""
+    writer = None
+    checkpoint_counter = 0
+    total_chunks_written = 0
+    start_time = time.time()
+    
+    # Open output file
+    f_out = open(output_file, 'w', encoding='utf-8', newline='')
+    writer = csv.writer(f_out, delimiter='\t')
+    writer.writerow(["row_id", "chunk_id", "problem", "solution_chunk", "expected_answer", "problem_from"])
+    
+    pbar = tqdm(total=total_lines, desc="Processing Records")
+    
+    try:
+        for batch_idx, (batch_lines, batch_indices) in enumerate(batch_iterator):
+            # Create (line, idx) tuples for each record
+            batch_with_indices = list(zip(batch_lines, batch_indices))
+            
+            # Process batch
+            processed_batch = list(pool.imap(process_record_cpu_part, batch_with_indices, chunksize=100))
+            processed_batch = process_batch(embedder, processed_batch)
+            
+            # Write results
+            batch_chunks = 0
+            for record in processed_batch:
+                if not record:
+                    continue
+                    
+                chunks = chunk_sentences(record)
+                for chunk_id, chunk_text in enumerate(chunks):
+                    writer.writerow([
+                        record["line_idx"],  # Now using the correct line index
+                        chunk_id,
+                        sanitize_for_tsv(record["problem"]),
+                        sanitize_for_tsv(chunk_text),
+                        sanitize_for_tsv(str(record["expected_answer"])),
+                        sanitize_for_tsv(str(record["problem_source"]))
+                    ])
+                    batch_chunks += 1
+            
+            total_chunks_written += batch_chunks
+            checkpoint_counter += len(batch_lines)
+            
+            # Update progress
+            pbar.update(len(batch_lines))
+            pbar.set_postfix({
+                "Chunks": f"{total_chunks_written:,}",
+                "Rec/s": f"{(batch_idx * PROCESSING_BATCH_SIZE)/(time.time()-start_time):.1f}"
+            })
+            
+            # Checkpoint
+            if checkpoint_counter >= CHECKPOINT_INTERVAL:
+                f_out.flush()
+                os.fsync(f_out.fileno())
+                checkpoint_counter = 0
+                logger.info(
+                    f"Checkpoint: Processed {batch_idx * PROCESSING_BATCH_SIZE:,} records, "
+                    f"{total_chunks_written:,} chunks, "
+                    f"{(batch_idx * PROCESSING_BATCH_SIZE)/(time.time()-start_time):.1f} rec/s"
+                )
+            
+            # Clear memory
+            del processed_batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+    except Exception as e:
+        logger.error(f"Error during processing: {e}")
+        raise
+    finally:
+        pbar.close()
+        f_out.close()
+    
+    return total_chunks_written
 
 if __name__ == "__main__":
-    print(f"Reading from JSONL: {INPUT_JSONL_FILE}")
-    print(f"Writing TSV to:    {OUTPUT_TSV_FILE}\n")
+    logger.info(f"Reading from JSONL: {INPUT_JSONL_FILE}")
+    logger.info(f"Writing TSV to: {OUTPUT_TSV_FILE}")
 
-    total_records = 0
-    total_chunks = 0
+    # Remove existing files
+    for f in [OUTPUT_TSV_FILE, TEMP_OUTPUT_FILE]:
+        if os.path.exists(f):
+            os.remove(f)
 
-    with open(INPUT_JSONL_FILE, "r", encoding="utf-8") as f_in, \
-         open(OUTPUT_TSV_FILE, "w", encoding="utf-8") as f_out:
+    # Load model
+    try:
+        logger.info("Loading BGE-M3 model...")
+        embedder = BGEM3FlagModel(
+            'BAAI/bge-m3', 
+            use_fp16=True,
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        logger.info("✅ Model loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        exit()
 
-        f_out.write("row_id\tchunk_id\tproblem\tsolution_chunk\tsolution\tproblem_from\n")
+    # Count lines
+    logger.info("Counting lines in input file...")
+    try:
+        total_lines = count_lines(INPUT_JSONL_FILE)
+        logger.info(f"Total records to process: {total_lines:,}")
+    except Exception as e:
+        logger.error(f"Failed to count lines: {e}")
+        exit()
 
-        ctx = get_context("spawn")
-        with ctx.Pool(processes=NUM_WORKERS, initializer=worker_init) as pool:
-            batch = []
-            for line_idx, line in enumerate(f_in):
-                batch.append((line_idx, line))
-                if len(batch) >= BATCH_SIZE:
-                    for res_lines in pool.imap_unordered(process_json_record, batch):
-                        for out_line in res_lines:
-                            f_out.write(out_line)
-                        total_chunks += len(res_lines)
-                    total_records += len(batch)
-                    if total_records % 500 == 0:
-                        print(f"Processed {total_records} records, generated ~{total_chunks} chunks...")
-                    batch = []
-
-            if batch:
-                for res_lines in pool.imap_unordered(process_json_record, batch):
-                    for out_line in res_lines:
-                        f_out.write(out_line)
-                    total_chunks += len(res_lines)
-                total_records += len(batch)
-
-    print(f"\nFinished! Total records processed: {total_records}")
-    print(f"Total chunks written: {total_chunks}")
-    print(f"TSV file saved at: {OUTPUT_TSV_FILE}")
+    # Process in chunks
+    ctx = get_context("spawn")
+    try:
+        with ctx.Pool(processes=NUM_CPU_WORKERS, initializer=worker_init_cpu) as pool:
+            with open(INPUT_JSONL_FILE, "r", encoding="utf-8") as f_in:
+                batch_iterator = batch_generator(f_in, PROCESSING_BATCH_SIZE)
+                total_chunks = process_batches(
+                    embedder, pool, batch_iterator, total_lines, TEMP_OUTPUT_FILE
+                )
+        
+        # Finalize output
+        os.rename(TEMP_OUTPUT_FILE, OUTPUT_TSV_FILE)
+        logger.info(f"\n✅ Finished processing {total_lines:,} records")
+        logger.info(f"Total chunks written: {total_chunks:,}")
+        logger.info(f"Output file: {OUTPUT_TSV_FILE}")
+        
+    except Exception as e:
+        logger.error(f"Processing failed: {e}")
+        if os.path.exists(TEMP_OUTPUT_FILE):
+            logger.info(f"Partial output saved at: {TEMP_OUTPUT_FILE}")
+        exit(1)

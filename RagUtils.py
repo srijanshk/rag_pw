@@ -182,9 +182,16 @@ def prepare_generator_inputs(
             # Ensure titles and texts lists are long enough for doc j
             doc_title = retrieved_doc_titles[i][j] if j < len(retrieved_doc_titles[i]) else ""
             doc_text = retrieved_doc_texts[i][j] if j < len(retrieved_doc_texts[i]) else ""
+
+
             
             # RAG-style formatting: question <sep> title <sep> passage
             # Using simple textual separators. The generator_tokenizer will handle BOS/EOS.
+            formatted_string = f"""Use the following hint to solve the math problem. Think step by step.
+                Hint: {doc_text}
+                ---
+                Question: {question_str}
+                Answer:"""
             formatted_string = f"{question_str} [SEP_TITLE] {doc_title} [SEP_TEXT] {doc_text}"
             all_formatted_strings_for_generator.append(formatted_string)
 
