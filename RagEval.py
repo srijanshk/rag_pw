@@ -6,6 +6,8 @@ import pandas as pd
 from RagUtils import hybrid_retrieve_documents_for_batch, prepare_generator_inputs, retrieve_documents_for_batch
 import evaluate
 from typing import List, Dict, Any, Tuple
+from evaluate import load as load_metric
+import re
 
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
@@ -300,3 +302,66 @@ def evaluate_custom_rag_model(
     question_encoder_model.train()
     generator_model.train()
     return metrics, logged_qa_retrieval_samples_eval
+
+
+def extract_final_answer(text: str) -> str:
+    """Extracts the final numeric answer from a GSM8K-style string."""
+    match = re.search(r"####\s*([\d\.,]+)", text)
+    if match:
+        return match.group(1).replace(",", "")
+    
+    # Fallback for generated text: find the last number
+    tokens = re.findall(r"-?[\d\.,]+", text)
+    return tokens[-1].replace(",", "") if tokens else ""
+
+def evaluate_reasoning(
+    generator_model,
+    eval_dataloader,
+    retriever, # Your DenseRetriever instance
+    question_encoder,
+    generator_tokenizer,
+    k_retrieved,
+    device,
+    # ... other params
+):
+    generator_model.eval()
+    question_encoder.eval()
+    
+    predictions = []
+    references = []
+    
+    for batch in tqdm(eval_dataloader, desc="Evaluating Reasoning"):
+        questions = batch["original_question"]
+        gold_solutions = batch["original_solution"]
+        
+        # 1. Retrieve
+        with torch.no_grad():
+            q_inputs = retriever.query_encoder.tokenize(questions) # Assuming retriever has tokenizer
+            q_inputs = {k: v.to(device) for k,v in q_inputs.items()}
+            query_embeddings = question_encoder(**q_inputs)[0]
+            retrieved_docs_batch = [retriever.search(q, k=k_retrieved) for q in questions]
+
+        # 2. Construct Prompts and Generate
+        prompts = []
+        for i, q in enumerate(questions):
+            hint_str = "\n".join([f"Hint: {trace['text']}" for trace in retrieved_docs_batch[i]])
+            prompt = f"Hint: {hint_str}\nQuestion: {q}\nAnswer:"
+            prompts.append(prompt)
+            
+        inputs = generator_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+        with torch.no_grad():
+            output_ids = generator_model.generate(**inputs, max_new_tokens=512)
+        
+        generated_solutions = generator_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+
+        # 3. Extract final answers for comparison
+        for gen_sol, gold_sol in zip(generated_solutions, gold_solutions):
+            predictions.append(extract_final_answer(gen_sol))
+            references.append(extract_final_answer(gold_sol))
+
+    # 4. Calculate Final Answer Accuracy
+    correct = sum(1 for p, r in zip(predictions, references) if p == r)
+    accuracy = correct / len(predictions) if predictions else 0.0
+    
+    print(f"Final Answer Accuracy: {accuracy:.4f}")
+    return {"final_answer_accuracy": accuracy}

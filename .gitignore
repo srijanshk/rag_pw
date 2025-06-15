@@ -38,3 +38,4 @@ wandb/
 baseline_results/*
 thesis_datasets/*
 
+unsloth_compiled_cache/*
