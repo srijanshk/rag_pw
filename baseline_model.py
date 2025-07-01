@@ -54,7 +54,7 @@ def extract_final_numeric_answer(generated_text: str) -> str:
     return tokens[-1] if tokens else ""
 
 
-def split_reasoning_and_answer(generated_text: str) -> (str, str):
+def split_reasoning_and_answer(generated_text: str) -> (str, str): # type: ignore
     """
     Wrap the entire generated chain-of-thought in <reasoning> tags, and
     put the extracted numeric answer inside <answer> tags.

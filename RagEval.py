@@ -365,3 +365,215 @@ def evaluate_reasoning(
     
     print(f"Final Answer Accuracy: {accuracy:.4f}")
     return {"final_answer_accuracy": accuracy}
+
+def evaluate_rag_sequence(
+    question_encoder, 
+    generator_model, 
+    dense_retriever, 
+    eval_dataloader, 
+    generator_tokenizer,
+    device,
+    k_retrieved=10
+):
+
+    """
+    Runs the full evaluation pipeline for the RAG-Sequence model.
+    """
+    question_encoder.eval()
+    generator_model.eval()
+
+    all_predictions = []
+    all_golds = []
+    logged_examples = []
+
+    with torch.no_grad():
+        for batch in tqdm(eval_dataloader, desc="Running Evaluation"):
+            questions = batch['original_question']
+            gold_answers = batch['original_answer']
+
+            # Process each question in the batch individually
+            for i, question_text in enumerate(questions):
+                # 1. Retrieve and Rerank Documents for a single question
+                retrieved_docs = dense_retriever.search(question_text, k=50)
+                if not retrieved_docs:
+                    # Handle cases where no documents are found
+                    all_predictions.append("")
+                    all_golds.append(extract_gsm8k_gold_answer(gold_answers[i]))
+                    continue
+
+                query_doc_pairs = [[question_text, doc['solution_chunk']] for doc in retrieved_docs]
+                reranker_scores = dense_retriever.model.compute_score(query_doc_pairs)['colbert']
+                for doc, score in zip(retrieved_docs, reranker_scores):
+                    doc['rerank_score'] = score
+                
+                reranked_docs = sorted(retrieved_docs, key=lambda x: x['rerank_score'], reverse=True)
+                top_k_docs = reranked_docs[:k_retrieved]
+                
+                # 2. Prepare k inputs for the generator, one for each document
+                contexts = [doc['solution_chunk'] for doc in top_k_docs]
+                inputs_for_gen = [f"Question: {question_text} Context: {c}" for c in contexts]
+                
+                tokenized_inputs = generator_tokenizer(
+                    inputs_for_gen,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                ).to(device)
+
+                # 3. Generate k answers and get their scores
+                generated_outputs = generator_model.generate(
+                    **tokenized_inputs,
+                    max_length=512,
+                    num_beams=4,
+                    early_stopping=True,
+                    return_dict_in_generate=True,
+                    output_scores=True
+                )
+                
+                sequence_scores = generated_outputs.sequences_scores
+                best_sequence_idx = torch.argmax(sequence_scores).item()
+                
+                # Select the single best answer based on the highest score
+                best_generation_ids = generated_outputs.sequences[best_sequence_idx]
+                best_generated_answer = generator_tokenizer.decode(best_generation_ids, skip_special_tokens=True)
+
+                # 4. Parse and store results for the question
+                pred_ans = extract_final_numeric_answer(best_generated_answer)
+                gold_ans = extract_gsm8k_gold_answer(gold_answers[i])
+                all_predictions.append(pred_ans)
+                all_golds.append(gold_ans)
+                
+                logged_examples.append({
+                    "question": question_text,
+                    "gold_answer": gold_answers[i],
+                    "parsed_gold": gold_ans,
+                    "generated_answer": best_generated_answer,
+                    "parsed_prediction": pred_ans,
+                    "best_answer_score": sequence_scores[best_sequence_idx].item()
+                })
+
+    # --- Final Metric Calculation ---
+    accuracy = compute_answer_accuracy(all_predictions, all_golds)
+    return {"EM_accuracy": accuracy}, logged_examples
+
+def evaluate_rag_token(
+    question_encoder, 
+    generator_model, 
+    dense_retriever, 
+    eval_dataloader, 
+    generator_tokenizer,
+    device,
+    k_retrieved=5
+):
+    """
+    Runs an evaluation pipeline that mimics the RAG-Token style.
+    It combines the output probabilities (logits) from multiple documents
+    before generating the final token sequence.
+    """
+    question_encoder.eval()
+    generator_model.eval()
+
+    all_predictions = []
+    all_golds = []
+    logged_examples = []
+
+    with torch.no_grad():
+        for batch in tqdm(eval_dataloader, desc="Running Evaluation"):
+            questions = batch['original_question'] # Use original strings for pipeline
+            gold_answers = batch['original_answer']
+
+            # Process each question in the batch individually
+            for i, question_text in enumerate(questions):
+                # 1. Retrieve and Rerank Documents for a single question
+                retrieved_docs = dense_retriever.search(question_text, k=20)
+                if not retrieved_docs:
+                    all_predictions.append("")
+                    all_golds.append(extract_gsm8k_gold_answer(gold_answers[i]))
+                    continue
+
+                query_doc_pairs = [[question_text, doc['solution_chunk']] for doc in retrieved_docs]
+                reranker_scores = dense_retriever.model.compute_score(query_doc_pairs)['colbert']
+                for doc, score in zip(retrieved_docs, reranker_scores):
+                    doc['rerank_score'] = score
+                
+                reranked_docs = sorted(retrieved_docs, key=lambda x: x['rerank_score'], reverse=True)
+                top_k_docs = reranked_docs[:k_retrieved]
+                
+                # 2. Prepare k inputs for the generator, one for each document
+                contexts = [doc['solution_chunk'] for doc in top_k_docs]
+                inputs_for_gen = [f"Question: {question_text} Context: {c}" for c in contexts]
+                
+                tokenized_inputs = generator_tokenizer(
+                    inputs_for_gen,
+                    padding=True,
+                    truncation=True,
+                    max_length=1024,
+                    return_tensors="pt"
+                ).to(device)
+
+                # 3. Generate logits for each of the k inputs
+                # This is a single forward pass that gets all the logits at once.
+                outputs = generator_model(**tokenized_inputs)
+                
+                # outputs.logits has shape [k_retrieved, sequence_length, vocab_size]
+                # We average the logits across the k documents to get a single probability distribution
+                avg_logits = torch.mean(outputs.logits, dim=0) # Shape: [sequence_length, vocab_size]
+                
+                # 4. Decode the final answer by taking the most likely token at each position
+                predicted_token_ids = torch.argmax(avg_logits, dim=-1)
+                
+                # Decode the token IDs into a text string
+                generated_answer = generator_tokenizer.decode(predicted_token_ids, skip_special_tokens=True)
+
+                # 5. Parse and store results for the question
+                pred_ans = extract_final_numeric_answer(generated_answer)
+                gold_ans = extract_gsm8k_gold_answer(gold_answers[i])
+                all_predictions.append(pred_ans)
+                all_golds.append(gold_ans)
+                
+                logged_examples.append({
+                    "question": question_text,
+                    "gold_answer": gold_answers[i],
+                    "parsed_gold": gold_ans,
+                    "generated_answer": generated_answer,
+                    "parsed_prediction": pred_ans,
+                })
+
+    # --- Final Metric Calculation ---
+    accuracy = compute_answer_accuracy(all_predictions, all_golds)
+    return {"EM_accuracy": accuracy}, logged_examples
+
+def extract_final_numeric_answer(generated_text: str) -> str:
+    """
+    Heuristic: Find the last integer or decimal number in the generated text.
+    Returns that number as a string, or "" if none found.
+    Handles numbers with commas.
+    """
+    if isinstance(generated_text, str):
+        generated_text = generated_text.replace(',', '')
+    else:
+        generated_text = str(generated_text)
+    tokens = re.findall(r"-?\d+\.\d+|-?\d+", generated_text)
+    return tokens[-1] if tokens else ""
+
+def extract_gsm8k_gold_answer(answer_field: str) -> str:
+    """
+    From GSM8K 'answer' field (e.g., "...#### <num>"), extracts the gold numeric answer.
+    """
+    if isinstance(answer_field, str):
+        m = re.search(r"####\s*([-\d\.,]+)", answer_field)
+        if m:
+            return m.group(1).replace(',', '')
+        tokens = re.findall(r"-?\d+\.\d+|-?\d+", answer_field.replace(',', ''))
+        return tokens[-1] if tokens else ""
+    return str(answer_field)
+
+def compute_answer_accuracy(preds: list, golds: list) -> float:
+    """
+    Computes exact-match accuracy between two lists of parsed numeric strings.
+    """
+    if len(preds) != len(golds):
+        raise ValueError("Prediction and gold lists must have the same length.")
+    correct = sum(1 for p, g in zip(preds, golds) if str(p).strip() == str(g).strip())
+    return (correct / len(preds)) * 100 if preds else 0.0

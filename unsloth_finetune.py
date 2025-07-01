@@ -1,7 +1,9 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
 from unsloth import FastLanguageModel
 
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+
 import torch
 import wandb
 import argparse

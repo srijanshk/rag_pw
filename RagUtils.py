@@ -209,6 +209,48 @@ def prepare_generator_inputs(
         "generator_attention_mask": tokenized_generator_inputs.attention_mask.to(device)
     }
 
+def calculate_rag_token_loss(
+    query_embeddings,
+    retrieved_doc_embeddings,
+    generator_outputs,
+    target_labels,
+    generator_pad_token_id,
+    n_docs,
+    device
+):
+    """
+    Calculates loss for a RAG-Token model by marginalizing over documents,
+    weighted by the retriever scores, before the cross-entropy calculation.
+    """
+    # 1. Calculate document scores p_eta(z|x)
+    # This is the dot product between the query and document embeddings.
+    expanded_query_embeddings = query_embeddings.unsqueeze(1)
+    doc_scores = torch.bmm(expanded_query_embeddings, retrieved_doc_embeddings.transpose(1, 2)).squeeze(1)
+    doc_log_probs = F.log_softmax(doc_scores, dim=1)
+
+    # 2. Get token generation probabilities p_theta(yi|x, z, ...)
+    batch_size = target_labels.shape[0]
+    seq_len = target_labels.shape[1]
+    vocab_size = generator_outputs.logits.shape[-1]
+    
+    logits = generator_outputs.logits.view(batch_size, n_docs, -1, vocab_size)
+    token_log_probs = F.log_softmax(logits, dim=-1)
+    
+    # 3. Combine and marginalize
+    # Add doc log probs to token log probs (log(p_eta * p_theta))
+    # Expand doc_log_probs to broadcast correctly over seq_len and vocab_size
+    expanded_doc_log_probs = doc_log_probs.unsqueeze(-1).unsqueeze(-1)
+    combined_log_probs = token_log_probs + expanded_doc_log_probs
+    
+    # Marginalize using logsumexp over the document dimension
+    marginalized_log_probs = torch.logsumexp(combined_log_probs, dim=1)
+
+    # 4. Calculate NLL loss
+    loss_fct = torch.nn.NLLLoss(ignore_index=generator_pad_token_id)
+    loss = loss_fct(marginalized_log_probs.view(-1, vocab_size), target_labels.view(-1))
+    
+    return loss
+
 def calculate_rag_loss(
     query_embeddings: torch.Tensor,              # [batch_size, query_embed_dim]
     retrieved_doc_embeddings: torch.Tensor,    # [batch_size, n_docs, doc_embed_dim]

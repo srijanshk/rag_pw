@@ -105,3 +105,19 @@ def load_precomputed_sparse_results(jsonl_file_path: str) -> Dict[str, List[Dict
         print(f"Error loading pre-computed sparse results from {jsonl_file_path}: {e}")
     return lookup_dict
     
+def extract_final_numeric_answer(text):
+    text = str(text).replace(',', '')
+    tokens = re.findall(r"-?\d+\.\d+|-?\d+", text)
+    return tokens[-1] if tokens else ""
+
+def extract_gsm8k_gold_answer(text):
+    if isinstance(text, str):
+        m = re.search(r"####\s*([-\d\.,]+)", text)
+        if m: return m.group(1).replace(',', '')
+        tokens = re.findall(r"-?\d+\.\d+|-?\d+", text.replace(',', ''))
+        return tokens[-1] if tokens else ""
+    return str(text)
+
+def compute_accuracy(preds, golds):
+    correct = sum(1 for p, g in zip(preds, golds) if p.strip() == g.strip())
+    return (correct / len(preds)) * 100 if preds else 0.0

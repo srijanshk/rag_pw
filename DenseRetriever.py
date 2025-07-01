@@ -11,7 +11,9 @@ class DenseRetriever:
                  embedding_model: BGEM3FlagModel,
                  index_path: str,
                  metadata_path: str,
-                 device: str = 'cuda'):
+                 device: str = 'cuda',
+                 ef_search: int = 700
+                 ):
         """
         A simplified retriever for Faiss indexes that uses a pre-initialized BGE-M3 model.
 
@@ -27,14 +29,20 @@ class DenseRetriever:
         
         logger.info(f"Loading Faiss index from: {index_path}")
         self.index = faiss.read_index(index_path)
-        # For GPU-based search, you can move the index to a GPU resource
-        if self.device == 'cuda':
-            try:
-                self.res = faiss.StandardGpuResources()
-                self.index = faiss.index_cpu_to_gpu(self.res, 0, self.index) # Use GPU 0
-                logger.info("Successfully moved Faiss index to GPU.")
-            except Exception as e:
-                logger.warning(f"Could not move Faiss index to GPU, will use CPU for search. Error: {e}")
+        inner = self.index
+        while hasattr(inner, "index"):
+            inner = inner.index
+        # ensure we have the proper subclass wrapper for HNSW
+        inner = faiss.downcast_index(inner)
+
+        # ensure it's truly an HNSW index
+        if not hasattr(inner, "hnsw"):
+            raise ValueError(f"Index at {index_path} isn’t an HNSW index (found {type(inner)})")
+
+        # tune HNSW parameters
+        inner.hnsw.efSearch = ef_search
+        logger.info(f"Using HNSW index; set efSearch={ef_search}")
+
 
         logger.info(f"Loading metadata from: {metadata_path}")
         self.metadata = self._load_metadata(metadata_path)
@@ -60,21 +68,22 @@ class DenseRetriever:
         if not queries:
             return []
             
-        # BGE-M3 does not require special prefixes like "query: "
         embedding_dict = self.model.encode(
             queries, 
             return_dense=True, 
             return_sparse=False, 
             return_colbert_vecs=False,
-            batch_size=128 # A reasonable inference batch size
+            batch_size=128
         )
         query_embeddings = embedding_dict['dense_vecs']
+        query_embedding_32 = query_embeddings.astype(np.float32)
+
         
         # L2 normalize the query embedding for cosine similarity search
-        faiss.normalize_L2(query_embeddings)
+        faiss.normalize_L2(query_embedding_32)
 
         # Search the Faiss index
-        distances, indices = self.index.search(query_embeddings.astype(np.float32), k)
+        distances, indices = self.index.search(query_embedding_32, k)
         
         batch_results = []
         for i in range(len(queries)):
