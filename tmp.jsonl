@@ -1,0 +1,102 @@
+[
+  {
+    "id": 0,
+    "question": "How many vertical asymptotes does the graph of $y=\\frac{2}{x^2+x-6}$ have?",
+    "prediction": "2",
+    "ground_truth": "The denominator of the rational function factors into $x^2+x-6=(x-2)(x+3)$. Since the numerator is always nonzero, there is a vertical asymptote whenever the denominator is $0$, which occurs for $x = 2$ and $x = -3$.  Therefore, the graph has $\\boxed{2}$ vertical asymptotes.",
+    "raw_response": "searchvertical asymptotes of rational function denominatorsearch\nsearch\nTo find the vertical asymptotes, I need to find the values of x that make the denominator zero.\nThe denominator is $x^2+x-6$.\nSetting it to zero: $x^2+x-6 = 0$\nFactoring the quadratic: $(x+3)(x-2) = 0$\nThe solutions are $x=-3$ and $x=2$.\nThere are two values that make the denominator zero.\n<answer>2</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 1,
+    "question": "What is the positive difference between $120\\%$ of 30 and $130\\%$ of 20?",
+    "prediction": "10",
+    "ground_truth": "One hundred twenty percent of 30 is $120\\cdot30\\cdot\\frac{1}{100}=36$, and $130\\%$ of 20 is $ 130\\cdot 20\\cdot\\frac{1}{100}=26$.  The difference between 36 and 26 is $\\boxed{10}$.",
+    "raw_response": "searchpercentagesearch\nsearch\nTo find the positive difference between $120\\%$ of 30 and $130\\%$ of 20, we first need to calculate each percentage value.\n$120\\%$ of 30 is calculated as $1.2 \\times 30 = 36$.\n$130\\%$ of 20 is calculated as $1.3 \\times 20 = 26$.\nThe positive difference between 36 and 26 is $|36 - 26| = 10$.\n<answer>10</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 2,
+    "question": "Find $x$ such that $\\lceil x \\rceil + x = \\dfrac{23}{7}$. Express $x$ as a common fraction.",
+    "prediction": "25",
+    "ground_truth": "First, we note that $x$ must be positive, since otherwise $\\lceil x \\rceil + x$ is nonpositive. Next, we know that the decimal part of $x$ must be $\\dfrac{2}{7}$. We write $x$ as $n+\\dfrac{2}{7}$, where $n$ is the greatest integer less than $x.$ Then, $\\lceil x \\rceil = n + 1.$ Therefore, we can write $\\lceil x \\rceil + x$ as $n+1+n+\\dfrac{2}{7}=\\dfrac{23}{7}$. Solving, we get $n=1$. Therefore, the only value $x$ that satisfies the equation is $1+\\dfrac{2}{7}=\\boxed{\\dfrac{9}{7}}$.",
+    "raw_response": "searchceiling function and fractionssearch\nsearch\nSince $\\lceil x \\rceil$ is the smallest integer greater than or equal to $x$, we can write $\\lceil x \\rceil = n$, where $n$ is an integer.\nWe are given that $\\lceil x \\rceil + x = \\dfrac{23}{7}$, so we can substitute $n$ into the equation:\n$n + x = \\dfrac{23}{7}$\nWe know that $n$ is an integer, so we can try different values of $n$ to see if we can find a solution.\nIf $n=2$, then $x = \\dfrac{23}{7} - 2 = \\dfrac{11}{7}$, which is not an integer.\nIf $n=3$, then $x = \\dfrac{23}{7} - 3 = -\\dfrac{4}{7}$, which is also not an integer.\nIf $n=4$, then $x = \\dfrac{23}{7} - 4 = -\\dfrac{13}{7}$, which is not an integer either.\nIf $n=5$, then $x = \\dfrac{23}{7} - 5 = -\\dfrac{22}{7}$, which is not an integer.\nIf $n=6$, then $x = \\dfrac{23}{7} - 6 = -\\dfrac{31}{7}$, which is not an integer.\nIf $n=7$, then $x = \\dfrac{23}{7} - 7 = -\\dfrac{40}{7}$, which is not an integer.\nIf $n=8$, then $x = \\dfrac{23}{7} - 8 = -\\dfrac{49}{7}$, which is not an integer.\nIf $n=9$, then $x = \\dfrac{23}{7} - 9 = -\\dfrac{58}{7}$, which is not an integer.\nIf $n=10$, then $x = \\dfrac{23}{7} - 10 = -\\dfrac{67}{7}$, which is not an integer.\nIf $n=11$, then $x = \\dfrac{23}{7} - 11 = -\\dfrac{76}{7}$, which is not an integer.\nIf $n=12$, then $x = \\dfrac{23}{7} - 12 = -\\dfrac{85}{7}$, which is not an integer.\nIf $n=13$, then $x = \\dfrac{23}{7} - 13 = -\\dfrac{94}{7}$, which is not an integer.\nIf $n=14$, then $x = \\dfrac{23}{7} - 14 = -\\dfrac{103}{7}$, which is not an integer.\nIf $n=15$, then $x = \\dfrac{23}{7} - 15 = -\\dfrac{112}{7}$, which is not an integer.\nIf $n=16$, then $x = \\dfrac{23}{7} - 16 = -\\dfrac{121}{7}$, which is not an integer.\nIf $n=17$, then $x = \\dfrac{23}{7} - 17 = -\\dfrac{130}{7}$, which is not an integer.\nIf $n=18$, then $x = \\dfrac{23}{7} - 18 = -\\dfrac{139}{7}$, which is not an integer.\nIf $n=19$, then $x = \\dfrac{23}{7} - 19 = -\\dfrac{148}{7}$, which is not an integer.\nIf $n=20$, then $x = \\dfrac{23}{7} - 20 = -\\dfrac{157}{7}$, which is not an integer.\nIf $n=21$, then $x = \\dfrac{23}{7} - 21 = -\\dfrac{166}{7}$, which is not an integer.\nIf $n=22$, then $x = \\dfrac{23}{7} - 22 = -\\dfrac{175}{7}$, which is not an integer.\nIf $n=23$, then $x = \\dfrac{23}{7} - 23 = -\\dfrac{184}{7}$, which is not an integer.\nIf $n=24$, then $x = \\dfrac{23}{7} - 24 = -\\dfrac{193}{7}$, which is not an integer.\nIf $n=25$, then $x = \\dfrac{23}{7} - 25",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 3,
+    "question": "Evaluate $i^5+i^{-25}+i^{45}$.",
+    "prediction": "0",
+    "ground_truth": "We have $i^5 = i^4\\cdot i = 1\\cdot (i) = i$.  We also have $i^{-25} = 1/i^{25} = 1/(i^{24}\\cdot i) = 1/[1\\cdot (i)] = 1/i = \\frac1{i}\\cdot\\frac{i}{i} = i/(-1) = -i$ and $i^{45} = (i^{44})\\cdot i= 1\\cdot i =i$, and . So, adding these three results gives $i^5 + i^{-25} + i^{45} = i+-i+i = \\boxed{i}$.",
+    "raw_response": "searchEvaluating powers of i search\nsearch\nThe powers of i cycle every four powers: $i^1=i$, $i^2=-1$, $i^3=-i$, $i^4=1$, and then it repeats.\nTo evaluate $i^5$, we can use the fact that $i^4=1$. So, $i^5=i^4\\cdot i=1\\cdot i=i$.\nTo evaluate $i^{-25}$, we can rewrite it as $\\frac{1}{i^{25}}$. Since $i^{24}=1$, we have $\\frac{1}{i^{25}}=\\frac{1}{i^{24}\\cdot i}=\\frac{1}{1\\cdot i}=\\frac{1}{i}$. We can multiply both the numerator and denominator by $i$ to get $\\frac{i}{i^2}=\\frac{i}{-1}=-i$.\nTo evaluate $i^{45}$, we can use the fact that $i^4=1$. So, $i^{45}=i^{44}\\cdot i=(i^4)^{11}\\cdot i=1^{11}\\cdot i=i$.\nNow, we can add the three terms together: $i^5+i^{-25}+i^{45}=i+(-i)+i=0$.\n<answer>0</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 4,
+    "question": "If $2^8=4^x$, what is the value of $x$?",
+    "prediction": "4",
+    "ground_truth": "Rewrite $4$ as $2^2$ to find $4^x=2^{2x}$.  Since $2^8=2^{2x}$, we have $2x=8$ which implies $x=\\boxed{4}$.",
+    "raw_response": "searchexponent rulessearch\nsearch\nTo solve for x, we can use the property of exponents that states $a^{mn}=(a^m)^n$. We can rewrite $4^x$ as $(2^2)^x$, which is equal to $2^{2x}$.\nNow we have the equation $2^8=2^{2x}$.\nSince the bases are the same, we can equate the exponents: $8=2x$.\nDividing both sides by 2 gives us $x=4$.\n<answer>4</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 5,
+    "question": "What is the 100th term of the arithmetic sequence 6, 10, 14, 18, ...?",
+    "prediction": "402",
+    "ground_truth": "The common difference is $10 - 6 = 4$, so the 100th term is $6+99\\cdot 4=\\boxed{402}$.",
+    "raw_response": "searcharithmetic sequence common difference search\nsearch\nThe common difference is the constant difference between each consecutive term in an arithmetic sequence. In this case, the common difference is $10 - 6 = 4$, $14 - 10 = 4$, and $18 - 14 = 4$. The common difference is $4$.\nsearcharithmetic sequence nth term formula search\nsearch\nThe nth term of an arithmetic sequence can be found using the formula $a_n = a_1 + (n-1)d$, where $a_n$ is the nth term, $a_1$ is the first term, $n$ is the term number, and $d$ is the common difference.\nsearch\nIn this case, $a_1 = 6$, $d = 4$, and we want to find the 100th term, so $n = 100$.\nPlugging these values into the formula: $a_{100} = 6 + (100-1) \\cdot 4$\nSimplifying: $a_{100} = 6 + 99 \\cdot 4$\nMultiplying: $a_{100} = 6 + 396$\nAdding: $a_{100} = 402$\n<answer>402</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 6,
+    "question": "For what values of $x$ is it true that $x^2 - 5x - 4 \\le 10$? Express your answer in interval notation.",
+    "prediction": "[\u221227]",
+    "ground_truth": "Re-arranging, $x^2 - 5x - 14 \\le 0$. The left-hand quadratic factors as $x^2 - 5x - 14 = (x - 7)(x + 2) \\le 0$. Thus, $x-7$ and $x+2$ have opposite signs, so $-2 \\le x \\le 7$ and $\\boxed{x \\in [-2,7]}$.",
+    "raw_response": "searchinequality quadratic expressionsearch\nsearch\nTo solve the inequality, we first move all terms to one side to get $x^2 - 5x - 14 \\le 0$.\nsearchquadratic inequalitysearch\nsearch\nWe can factor the quadratic expression as $(x-7)(x+2) \\le 0$.\nsearchsolve quadratic inequality by factoringsearch\nsearch\nThe critical points are $x=-2$ and $x=7$. We can use a number line to test each interval.\nsearchtest intervals on a number line for inequalitysearch\nsearch\nThe solution is $[-2,7]$.\n<answer>[\u22122,7]</answer><|eot_id|>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 7,
+    "question": "Mr. Madoff invests 1000 dollars in a fund that compounds annually at a constant interest rate.  After three years, his investment has grown to 1225 dollars.  What is the annual interest rate, as a percentage?  (Round your answer to the nearest integer.)",
+    "prediction": "5",
+    "ground_truth": "Let $r$ be the annual interest rate.  Then after three years, Mr. Madoff's investment is $1000 \\cdot \\left( 1 + \\frac{r}{100} \\right)^3$, so \\[1000 \\cdot \\left( 1 + \\frac{r}{100} \\right)^3 = 1225.\\]Then \\[\\left( 1 + \\frac{r}{100} \\right)^3 = 1.225,\\]so \\[1 + \\frac{r}{100} = \\sqrt[3]{1.225} = 1.069987 \\dots,\\]which means $r = \\boxed{7}$, to the nearest integer.",
+    "raw_response": "search compound interest formula search\nsearch\nThe formula for compound interest is A = P(1 + r)^n, where A is the amount after n years, P is the principal amount (initial investment), r is the annual interest rate, and n is the number of years.\nWe know that A = 1225, P = 1000, and n = 3. We need to find r.\nPlugging in the values: 1225 = 1000(1 + r)^3\nDividing both sides by 1000: 1.225 = (1 + r)^3\nTaking the cube root of both sides: 1.05 = 1 + r\nSubtracting 1 from both sides: 0.05 = r\nTo convert to a percentage, multiply by 100: 5% = r\nRounding to the nearest integer: 5 = r\n<answer>5</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 8,
+    "question": "Four distinct integers $a$, $b$, $c$ and $d$ have the property that when added in pairs, the sums 10, 18, 19, 20, 21, and 29 are obtained. What are the four integers in increasing order? (place a comma and then a space between each integer)",
+    "prediction": "5 7 13 14",
+    "ground_truth": "WLOG, let $a<b<c<d$. The smallest sum is $a+b=10$. The second-smallest sum is $a+c=18$. The second-largest sum is $b+d=21$. The largest sum is $c+d=29$. In summary, \\begin{align*}\\tag{1}\na+b&=10\\\\ \\tag{2}\na+c&=18\\\\ \\tag{3}\nb+d&=21\\\\ \\tag{4}\nc+d&=29\n\\end{align*} There are two sums left, $a+d$ and $b+c$. We will break this problem into two cases, the first case in which the first of the two sums is smaller than the second, and the second case in which the first of the two sums is larger than the second.\n\nIn the first case \\begin{align*} \\tag{5}\na+d&=19\\\\ \\tag{6}\nb+c&=20\n\\end{align*} Adding Equations (1) and (6) and subtracting (2), we have $(a+b)+(b+c)-(a+c)=10+20-18\\Rightarrow b = 6$. Plugging this value into Equation (1), we find that $a+6=10 \\Rightarrow a=4$. Plugging the value of $a$ into Equation (2), we find that $4+c=18 \\Rightarrow c=14$. Plugging the value of $c$ into Equation (4), we find that $14+d=29 \\Rightarrow d=15$. Thus, the four integers are $4,6,14,15$.\n\nIn the second case, \\begin{align*} \\tag{7}\nb+c&=19\\\\ \\tag{8}\na+d&=20\n\\end{align*} Adding Equations (1) and (7) and subtracting Equation (2), we have $(a+b)+(b+c)-(a+c)=10+19-18 \\Rightarrow b=5.5$. This case is impossible because $b$ is defined to be an integer.\n\nThus, the only solution is $\\boxed{4,6,14,15}$.",
+    "raw_response": "searchpairwise sums of four integerssearch\nsearch\nLet's denote the four integers as $a$, $b$, $c$, and $d$. We are given that the pairwise sums of these integers are 10, 18, 19, 20, 21, and 29. We can represent these sums as follows:\n$a+b=10$\n$a+c=18$\n$a+d=19$\n$b+c=20$\n$b+d=21$\n$c+d=29$\nWe can add the first three equations together to get:\n$2(a+b+c+d)=56$\nDividing both sides by 2 gives us:\n$a+b+c+d=28$\nNow, we can subtract each of the original six equations from this sum to find the value of each integer:\n$a+b+c+d-(a+b)=28-10=18$\n$a+b+c+d-(a+c)=28-18=10$\n$a+b+c+d-(a+d)=28-19=9$\n$a+b+c+d-(b+c)=28-20=8$\n$a+b+c+d-(b+d)=28-21=7$\n$a+b+c+d-(c+d)=28-29=-1$\nSimplifying each equation, we get:\n$c+d=18$\n$a+c=18$\n$a+d=19$\n$b+c=20$\n$b+d=21$\n$c+d=29$\nFrom the first and third equations, we can see that $a$ and $c$ must be equal. Similarly, from the second and fourth equations, we can see that $b$ and $d$ must be equal. Therefore, we can let $a=c=x$ and $b=d=y$.\nSubstituting these values into the fifth equation, we get:\n$y+y=21$\n$2y=21$\n$y=10.5$\nSince $y$ must be an integer, this is a contradiction. Therefore, our assumption that $a=c$ and $b=d$ must be false.\nNow, let's try to find another way to solve the problem. From the first equation, we know that $a+b=10$. From the second equation, we know that $a+c=18$. Subtracting the first equation from the second equation, we get:\n$(a+c)-(a+b)=18-10$\n$c-b=8$\nFrom the third equation, we know that $a+d=19$. From the fourth equation, we know that $b+c=20$. Subtracting the third equation from the fourth equation, we get:\n$(b+c)-(a+d)=20-19$\n$b-a=1$\nNow we have two equations and two unknowns:\n$c-b=8$\n$b-a=1$\nAdding these two equations, we get:\n$(c-b)+(b-a)=8+1$\n$c-a=9$\nNow we have two equations and two unknowns:\n$c-a=9$\n$a+b=10$\nWe can solve for $a$ and $c$ by adding these two equations:\n$(c-a)+(a+b)=9+10$\n$c+b=19$\nNow we have two equations and two unknowns:\n$c+b=19$\n$b+c=20$\nSubtracting the second equation from the first equation, we get:\n$(c+b)-(b+c)=19-20$\n$0=-1$\nThis is a contradiction, so our assumption that $a$ and $c$ are not equal must be false.\nTherefore, we can let $a=c$ and $b=d$. Substituting these values into the first equation, we get:\n$a+a=10$\n$2a=10$\n$a=5$\nSubstituting this value into the second equation, we get:\n$5+c=18$\n$c=13$\nSubstituting these values into the third equation, we get:\n$5+d=19$\n$d=14$\nSubstituting these values into the fourth equation, we get:\n$13+b=20$\n$b=7$\nTherefore, the four integers in increasing order are $5, 7, 13, 14$.\n<answer>5, 7, 13, 14</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  },
+  {
+    "id": 9,
+    "question": "What is the smallest value of $x$ such that $|5x - 1| = |3x + 2|$? Express your answer as a common fraction.",
+    "prediction": "-1/8",
+    "ground_truth": "There are two cases, when $5x-1=3x+2$ and when $5x-1=-(3x+2).$ The two equations yield $x=\\frac{3}{2}$ and $x=-\\frac{1}{8},$ respectively, of which $x=\\boxed{-\\frac{1}{8}}$ is the smaller solution.",
+    "raw_response": "searchabsolute value equationsearch\nsearch\nTo solve the absolute value equation $|5x - 1| = |3x + 2|$, we need to consider two cases:\nCase 1: $5x - 1 = 3x + 2$\nSubtracting $3x$ from both sides gives $2x - 1 = 2$. Adding $1$ to both sides gives $2x = 3$. Dividing by $2$ gives $x = \\frac{3}{2}$.\nCase 2: $5x - 1 = -(3x + 2)$\nSimplifying gives $5x - 1 = -3x - 2$. Adding $3x$ to both sides gives $8x - 1 = -2$. Adding $1$ to both sides gives $8x = -1$. Dividing by $8$ gives $x = -\\frac{1}{8}$.\nSince we want the smallest value of $x$, we choose $x = -\\frac{1}{8}$.\n<answer>-1/8</answer>",
+    "num_retrievals": 0,
+    "retrieval_queries": [],
+    "retrieval_history": []
+  }
+]

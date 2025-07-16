@@ -5,14 +5,25 @@ import pandas as pd
 import wandb
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 from FlagEmbedding import BGEM3FlagModel
-from DenseRetriever import DenseRetriever
+from BGERetriever import BGERetriever
 
-# --- 1. CONFIGURATION ---
+
+# 1 · Configuration constants
+
 MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+STOP_STRING = "</search>"                            # sentinel that pauses gen
+MAX_SEARCH_TURNS = 2                                # safety‑guard
+
 GSM8K_TEST_FILE = "./thesis_datasets/gsm8k/test.jsonl"
 MATH_BASE_DIR = "./thesis_datasets/math_hendrycks"
 MATH_SUBJECTS = [
@@ -20,42 +31,189 @@ MATH_SUBJECTS = [
     "intermediate_algebra", "number_theory", "prealgebra", "precalculus"
 ]
 
-# --- 2. INITIALIZATION & DATA LOADING ---
+# 2 · Helper: one‑time construction of StopWordsCriteria
 
+class StopWordsCriteria(StoppingCriteria):
+    """Token‑level early‑exit that stops once *any* stop‑sequence appears."""
+
+    def __init__(self, stop_words_ids, tokenizer):
+        super().__init__()
+        # expect a *list of lists* of ids (same contract as HF impl)
+        self.stop_words = [torch.tensor(sw, dtype=torch.long) for sw in stop_words_ids]
+        self.stop_len = [len(sw) for sw in self.stop_words]
+
+    def _check_stop(self, input_ids):
+        last_n_tokens = input_ids[0]  # shape: (seq_len,)
+        for sw, n in zip(self.stop_words, self.stop_len):
+            if last_n_tokens.size(0) < n:
+                continue
+            if torch.equal(last_n_tokens[-n:], sw.to(last_n_tokens.device)):
+                return True
+        return False
+
+    def __call__(self, input_ids, scores, **kwargs):
+        return self._check_stop(input_ids)
+
+def build_stop_criteria(tokenizer, stop_str: str = STOP_STRING) -> StoppingCriteriaList:
+    """Return a StoppingCriteriaList that halts as soon as *stop_str* appears."""
+    # `tokenizer.encode` returns a *flat* list of ids; StopWordsCriteria expects
+    # a *list of token‑id lists*, hence the surrounding `[   ]`.
+    stop_ids = [tokenizer.encode(stop_str, add_special_tokens=False)]
+    return StoppingCriteriaList([StopWordsCriteria(stop_ids, tokenizer)])
+
+# 3 · System prompt that drives the Active‑RAG loop
+SYSTEM_PROMPT = """
+You are an expert competition-level mathematician with a large private memory **and**
+on-demand access to a math knowledge base. Use retrieval **only when your own recall seems
+insufficient.**
+
+### Format you MUST follow
+1. **Recall (max 8 sentences)**  
+   Think step-by-step and list the theorems / definitions that might solve the problem.  
+   Finish this stage with exactly one line:  
+   `NEED_SEARCH: yes`    – if you are <80 % confident your recall is enough  
+   `NEED_SEARCH: no`     – if you are ≥80 % confident
+
+2. **(optional) Search**  
+   If and only if `NEED_SEARCH: yes`, submit one query inside  
+   `<search>[your query here]</search>`  
+   · Keep it ≤12 tokens, no special characters.  
+   · After the search results are shown to you, summarise **at most 5 key facts** you actually use.
+
+3. **Solve**  
+   Combine your recall (and retrieved facts if any) into a rigorous derivation.  
+   Finish with the answer in the form `$\boxed{\\text{final answer}}$`.
+
+4. **If genuinely unsolved**, reply exactly `I cannot solve this problem.`
+
+### Norms
+- Prefer internal recall; retrieval is a *fallback*, not a crutch.  
+- Never hallucinate references—quote or paraphrase retrieved snippets instead.  
+- Keep your chain-of-thought short, factual, and free of unnecessary speculation.
+"""
+
+
+# 4 · Component initialisation (LLM + retriever)
 def initialize_components():
-    """Loads all models and the retriever."""
-    print("--- Initializing Models and Components ---")
+    """Load Llama‑3, BGE‑M3 retriever, tokenizer, etc."""
+    print("--- Initialising models and retriever ---")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    components = {}
-    
-    print("Loading Llama 3.1 model...")
-    components['tokenizer'] = AutoTokenizer.from_pretrained(MODEL_NAME)
-    components['llm'] = AutoModelForCausalLM.from_pretrained(
+
+    # ---- LLM ---------------------------------------------------------------
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+    llm = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
-        device_map="auto"
+        device_map="auto",
     )
-    
-    if components['tokenizer'].pad_token is None:
-        components['tokenizer'].pad_token = components['tokenizer'].eos_token
-        components['llm'].config.pad_token_id = components['llm'].config.eos_token_id
-        print("Tokenizer `pad_token` set to `eos_token`.")
-    
-    components['llm'].generation_config.temperature = None
-    components['llm'].generation_config.top_p = None
-    print("Removed default temperature and top_p to suppress warnings.")
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+        llm.config.pad_token_id = tok.eos_token_id
 
-    print("Loading Retriever (BGE-M3)...")
-    embedding_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
-    components['retriever'] = DenseRetriever(
-        embedding_model=embedding_model,
+    # Keep generation fully deterministic for evaluation
+    llm.generation_config.temperature = None
+    llm.generation_config.top_p = None
+
+    # ---- Retriever --------------------------------------------------------
+    emb_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+    retriever = BGERetriever(
+        embedding_model=emb_model,
         index_path="/local00/student/shakya/openmath_bge-m3_hnsw_index",
         metadata_path="/local00/student/shakya/openmath_bge-m3_metadata.jsonl",
-        device=device
+        device=device,
     )
-    
-    print("--- All components initialized successfully. ---")
-    return components
+
+    return {"tokenizer": tok, "llm": llm, "retriever": retriever,
+            "stopper": build_stop_criteria(tok)}
+
+# 5 ·  Utility: parse search query inside <search> tags
+
+def parse_for_search_query(text: str):
+    match = re.search(r"<search>(.*?)</search>", text)
+    return match.group(1).strip() if match else None
+
+def need_search(text: str) -> bool:
+    """Return True if the assistant decided NEED_SEARCH: yes."""
+    m = re.search(r"NEED_SEARCH:\s*(yes|no)", text, re.I)
+    return bool(m and m.group(1).lower() == "yes")
+
+# 6 ·  Run one Active‑RAG conversation (may trigger multiple searches)
+
+def get_active_rag_answer(components, question: str):
+    tok, llm = components["tokenizer"], components["llm"]
+    retriever = components["retriever"]
+    stopper = components["stopper"]
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": question},
+    ]
+
+    search_used = False
+
+    # ----- conversation loop (LLM → maybe search → LLM → …) --------------
+    for _turn in range(MAX_SEARCH_TURNS):
+        # 1) LLM step -------------------------------------------------------
+        input_ids = tok.apply_chat_template(messages, add_generation_prompt=True,
+                                            return_tensors="pt").to(llm.device)
+        out = llm.generate(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            max_new_tokens=1024,
+            stopping_criteria=stopper,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.pad_token_id,
+            repetition_penalty=1.15,
+            do_sample=False,
+        )
+        assistant_text = tok.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": assistant_text})
+
+        # 2) DECISION: NEED_SEARCH? ----------------------------------------
+        if not need_search(assistant_text):
+            # Model is confident or provided final answer → stop loop
+            break
+
+        # 3) RETRIEVAL PATH -------------------------------------------------
+        search_query = parse_for_search_query(assistant_text)
+        if not search_query:
+            # Model claimed it needs search but failed to emit query → ask again
+            messages.append({
+                "role": "user",
+                "content": "You said NEED_SEARCH: yes but gave no <search>. Please provide the query inside <search> tags."
+            })
+            continue  # go to next turn to let model try again
+
+        search_used = True
+        retrieved = run_retrieval_tool(search_query, retriever)
+
+        # Append traces and loop once more ---------------------------------
+        messages.append({"role": "user", "content": f"Search Results: {retrieved}"})
+    else:
+        # Reached MAX_SEARCH_TURNS without final answer
+        messages.append({"role": "assistant", "content": "I cannot solve this problem."})
+
+    return messages, search_used
+
+# 7 ·  Retrieval helper 
+def run_retrieval_tool(query: str, retriever: BGERetriever, k_final: int = 5):
+    """Retrieve → rerank → return nicely formatted text."""
+    docs = retriever.search(query, k=50)
+    if not docs:
+        return "No results found."
+
+    pairs = [[query, d["solution_chunk"]] for d in docs]
+    scores = retriever.model.compute_score(pairs)["colbert"]
+    for d, s in zip(docs, scores):
+        d["rerank_score"] = s
+    docs = sorted(docs, key=lambda d: d["rerank_score"], reverse=True)[:k_final]
+
+    return "Search Results:\n" + "\n".join(
+        f"[{i+1}] problem: {d['problem']}\n      solution: {d['solution_chunk']}…"
+        for i, d in enumerate(docs)
+    )
+
+# 8. Load local datasets (GSM8K and MATH)
 
 def load_gsm8k_local(path):
     """Loads GSM8K test data."""
@@ -80,74 +238,7 @@ def load_math_hendrycks_local(base_dir, subjects):
                     answers.append(obj.get("solution", "").strip())
     return questions, answers
 
-# --- 3. ACTIVE RAG WORKFLOW ---
-
-SYSTEM_PROMPT = """You are an expert mathematician. Your goal is to solve the user's question by thinking step-by-step. If you need a formula or fact you don't know, you must use the search tool by writing a query in the format: <search_query>your query here</search_query>. STOP your response after the tag. It will provide search results, and you must use them to continue your reasoning. When you have the final answer, state it clearly."""
-
-def parse_for_search_query(text: str):
-    match = re.search(r"<search_query>(.*?)</search_query>", text)
-    return match.group(1).strip() if match else None
-
-def run_retrieval_tool(query: str, retriever, k_final=5):
-    """Executes retrieval and reranking."""
-    retrieved_docs = retriever.search(query, k=50)
-    if not retrieved_docs:
-        return "No results found."
-
-    query_doc_pairs = [[query, doc['solution_chunk']] for doc in retrieved_docs]
-    reranker_scores = retriever.model.compute_score(query_doc_pairs)['colbert']
-    for doc, score in zip(retrieved_docs, reranker_scores):
-        doc['rerank_score'] = score
-    
-    reranked_docs = sorted(retrieved_docs, key=lambda x: x['rerank_score'], reverse=True)
-    
-    results_text = "Search Results:\n"
-    for i, doc in enumerate(reranked_docs[:k_final]):
-        results_text += f"[{i+1}] {doc['solution_chunk'][:400]}...\n"
-    
-    return results_text
-
-def get_active_rag_answer(components, question: str):
-    """Runs the active RAG loop and returns the full conversation history."""
-    llm = components['llm']
-    tokenizer = components['tokenizer']
-    retriever = components['retriever']
-    
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-    
-    for _ in range(5): # Max 5 tool uses per question to prevent infinite loops
-        input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(llm.device)
-        
-        outputs = llm.generate(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            max_new_tokens=512,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            do_sample=False,
-            num_beams=2,  # Use beam search to prevent repetitive output
-            early_stopping=True, # Stop when all beams have finished
-            output_attentions=True,
-            return_dict_in_generate=True
-        )
-        
-        response_text = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
-        messages.append({"role": "assistant", "content": response_text})
-        
-        search_query = parse_for_search_query(response_text)
-        
-        if search_query:
-            retrieved_results = run_retrieval_tool(search_query, retriever)
-            messages.append({"role": "user", "content": retrieved_results})
-        else:
-            break
-            
-    return messages
-
-# --- 4. METRIC CALCULATION & OUTPUT FORMATTING ---
+#9 . METRIC CALCULATION & OUTPUT FORMATTING
 
 def extract_final_numeric_answer(text: str) -> str:
     tokens = re.findall(r"-?\d+\.\d+|-?\d+", str(text).replace(',', ''))
@@ -173,8 +264,7 @@ def format_final_output(conversation_trace: list):
     for msg in conversation_trace:
         if msg['role'] == 'system': continue
         
-        # Add clear markers for the search queries and responses
-        if msg['role'] == 'assistant' and '<search_query>' in msg['content']:
+        if msg['role'] == 'assistant' and '<search>' in msg['content']:
             reasoning_block += f"--- LLM Reasoning & Search Query ---\n{msg['content']}\n\n"
         elif msg['role'] == 'user' and 'Search Results:' in msg['content']:
             reasoning_block += f"--- Retrieved Traces ---\n{msg['content']}\n\n"
@@ -191,14 +281,14 @@ def format_final_output(conversation_trace: list):
         f"<answer>\n{answer_block}\n</answer>"
     )
 
-# --- 5. MAIN EVALUATION SCRIPT ---
+# 10. MAIN EVALUATION SCRIPT ---
 
 def run_evaluation(components, questions, gold_answers, dataset_name):
     """A generic function to run evaluation on any given dataset."""
     results_data = []
     
     for question, gold_answer in tqdm(zip(questions, gold_answers), total=len(questions), desc=f"Evaluating Active RAG on {dataset_name}"):
-        conversation_trace = get_active_rag_answer(components, question)
+        conversation_trace, search_used = get_active_rag_answer(components, question)
         final_generated_text = conversation_trace[-1]['content']
         
         parsed_prediction = extract_final_numeric_answer(final_generated_text)
@@ -213,6 +303,7 @@ def run_evaluation(components, questions, gold_answers, dataset_name):
             "parsed_prediction": parsed_prediction,
             "parsed_gold": parsed_gold,
             "formatted_output": formatted_output,
+            "search_used": search_used,
         })
 
     predictions = [r['parsed_prediction'] for r in results_data]
@@ -230,7 +321,7 @@ def main():
     # --- WandB Setup ---
     wandb.init(
         project="active-rag-evaluation",
-        name="llama3.1-active-rag-gsm8k-math",
+        name="llama3.1-active-rag-gsm8k",
         config={"model_name": MODEL_NAME, "evaluation_type": "active_rag"}
     )
     
@@ -242,22 +333,21 @@ def main():
     gsm8k_df, gsm8k_accuracy = run_evaluation(components, gsm8k_questions, gsm8k_answers, "GSM8K")
     
     # Run MATH evaluation
-    print("\n--- Starting MATH Evaluation ---")
-    math_questions, math_answers = load_math_hendrycks_local(MATH_BASE_DIR, MATH_SUBJECTS)
-    math_df, math_accuracy = run_evaluation(components, math_questions, math_answers, "MATH")
+    # print("\n--- Starting MATH Evaluation ---")
+    # math_questions, math_answers = load_math_hendrycks_local(MATH_BASE_DIR, MATH_SUBJECTS)
+    # math_df, math_accuracy = run_evaluation(components, math_questions, math_answers, "MATH")
 
     # Combine results and save
     print("\n--- Combining and Saving All Results ---")
-    combined_df = pd.concat([gsm8k_df, math_df], ignore_index=True)
-    output_filename = "active_rag_results_combined.csv"
+    combined_df = pd.concat([gsm8k_df], ignore_index=True)
+    output_filename = "active_rag_results_gsm8k.csv"
     combined_df.to_csv(output_filename, index=False)
     print(f"Full results for both benchmarks saved to {output_filename}")
     
     # --- Log final metrics and tables to WandB ---
-    print("\n--- Logging Results to WandB ---")
     wandb.log({
         "GSM8K_Accuracy": gsm8k_accuracy,
-        "MATH_Accuracy": math_accuracy,
+        # "MATH_Accuracy": math_accuracy,
         "Combined_Results_Table": wandb.Table(dataframe=combined_df)
     })
     

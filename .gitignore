@@ -23,6 +23,7 @@ checkpoints/*
 downloads/*
 models/*
 mpnet/*
+data/*
 best_bart_model/*
 rag_custom_trained_final_v3/*
 rag_train_final_v3/*
