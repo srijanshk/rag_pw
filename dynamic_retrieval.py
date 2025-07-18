@@ -35,21 +35,31 @@ SEARCH_CLOSE     = "</search>"
 RETRIEVED_START  = "<retrieved>"
 RETRIEVED_END    = "</retrieved>"
 
-# Enhanced system message to encourage retrieval
 SYSTEM_MSG = """
-You are a mathematical problem solver who MUST follow this EXACT format:
+You are an expert competition mathematician with access to a retrieval tool.
 
-MANDATORY STEPS FOR EVERY PROBLEM:
-1. First, identify what formula or concept you need
-2. IMMEDIATELY write: <search>your search query here</search>
-3. Wait for retrieved examples between <retrieved>...</retrieved>
-4. Use the retrieved information to solve the problem
-5. End with: <answer>NUMERIC_ANSWER</answer>
+Follow this STRICT protocol **zero-shot** (no examples given):
 
-YOU MUST USE <search>...</search> BEFORE SOLVING. This is REQUIRED for EVERY problem.
-Never solve directly without searching first.
-CRITICAL: You MUST search before solving. Do NOT skip the search step.
-You MUST use the <search> tag to retrieve relevant examples before solving the problem.
+1. Begin every problem with a PLAN block listing each required formula, theorem, identity, definition, or fact as a bullet. For each item end the line with either KNOWN (you are fully certain) or UNKNOWN (any doubt).
+Format:
+<plan>
+- Binomial theorem expansion: KNOWN
+- Inclusion–Exclusion count of onto functions: UNKNOWN
+</plan>
+
+2. If there is at least one UNKNOWN item you MUST immediately output EXACTLY ONE search query on a single line inside <search>...</search> and then STOP (do not start solving yet).
+
+3. After you receive a <retrieved>...</retrieved> block, update any remaining UNKNOWN items (mark them KNOWN if resolved) and if any still UNKNOWN, issue another <search>...</search> (one query) and STOP again.
+
+4. Only when all items are KNOWN, write the detailed solution reasoning and finish with <answer>NUMERIC_ANSWER</answer>.
+
+Rules:
+- Never fabricate formulas; mark them UNKNOWN instead.
+- Keep each search query concise (≤ 12 words, no punctuation except parentheses if essential).
+- At most one query per <search> tag.
+- If everything is simple arithmetic / direct recall, you may have an empty UNKNOWN set and skip searching.
+
+If you are uncertain whether a formula name is exact, treat it as UNKNOWN.
 """
 
 CHAT_TEMPLATE = (
@@ -77,6 +87,108 @@ NUM_RE = re.compile(
     re.S | re.I,
 )
 specials = [RETRIEVE_TRIGGER, SEARCH_CLOSE, RETRIEVED_START, RETRIEVED_END]
+
+# ---------------------------------------------------------------------------
+# PLAN/UNKNOWN/auto-retrieval helpers
+# ---------------------------------------------------------------------------
+PLAN_RE = re.compile(r"<plan>(.*?)</plan>", re.S | re.I)
+UNKNOWN_LINE_RE = re.compile(r"\bUNKNOWN\b", re.I)
+
+STOPWORDS = {
+    "the","a","an","of","for","to","and","or","in","on","with","by",
+    "from","using","count","number","find","compute","formula","identity",
+    "function","value","values","prove","show","determine"
+}
+
+def extract_unknown_items(plan_text: str) -> list[str]:
+    lines = []
+    for raw in plan_text.splitlines():
+        if UNKNOWN_LINE_RE.search(raw):
+            # remove bullet markers
+            line = re.sub(r"^[\s*-]+", "", raw).strip()
+            # remove trailing 'UNKNOWN'
+            line = re.sub(r"\bUNKNOWN\b", "", line, flags=re.I).strip(" :")
+            if line:
+                lines.append(line)
+    return lines
+
+def build_query_from_unknowns(unknowns: list[str], max_words: int = 12) -> str:
+    # naive keyword extraction: take last 6 content words from each unknown line
+    words = []
+    for u in unknowns:
+        tokens = re.findall(r"[A-Za-z]+", u.lower())
+        content = [t for t in tokens if t not in STOPWORDS and len(t) > 2]
+        if not content:
+            content = tokens[-3:]
+        words.extend(content[-6:])
+    # de-duplicate preserving order
+    seen = set()
+    dedup = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            dedup.append(w)
+    return " ".join(dedup[:max_words]) or "math problem formula"
+
+
+# ---------------------------------------------------------------------------
+# Reasoning enforcement helpers
+# ---------------------------------------------------------------------------
+MIN_REASON_TOKENS = 60          # minimum approximate tokens (words) between last </plan> and <answer>
+MAX_EXPANSION_ROUNDS = 2        # safeguard to avoid infinite loops
+
+ANSWER_TAG_RE = re.compile(r"<answer>.*?</answer>", re.S | re.I)
+
+def _reasoning_token_count(txt: str) -> int:
+    """Approximate 'reasoning' length: words between last </plan> and first <answer>."""
+    plan_close = txt.rfind("</plan>")
+    if plan_close == -1:
+        return 0
+    ans_match = re.search(r"<answer>", txt, re.I)
+    if not ans_match:
+        return 0
+    segment = txt[plan_close + len("</plan>"): ans_match.start()]
+    # Strip retrieval blocks
+    segment = re.sub(r"<retrieved>.*?</retrieved>", "", segment, flags=re.S | re.I)
+    words = re.findall(r"\w+", segment)
+    return len(words)
+
+def _strip_last_answer(txt: str) -> str:
+    """Remove the last <answer>...</answer> block (if any)."""
+    matches = list(ANSWER_TAG_RE.finditer(txt))
+    if not matches:
+        return txt
+    m = matches[-1]
+    return txt[:m.start()]  # drop answer so we can force expansion
+
+# ---------------------------------------------------------------------------
+# Additional reasoning / answer control helpers
+# ---------------------------------------------------------------------------
+MIN_REASON_TOKENS_AFTER_RETR = 50   # reasoning tokens required AFTER last retrieval before answer allowed
+COMPLEX_KEYWORDS = {
+    "integral","probability","combinator","onto","surjective","inequality",
+    "sequence","limit","geometry","fraction","ceiling","floor","mod","divisor",
+    "prime","quadratic","polynomial","interest","compound","asymptote"
+}
+
+def _reasoning_token_count_after_last_retr(txt: str) -> int:
+    """Words between last </retrieved> (or </plan> if none) and first <answer>."""
+    base = txt.rfind(RETRIEVED_END)
+    if base == -1:
+        base = txt.rfind("</plan>")
+    if base == -1:
+        base = 0
+    ans_match = re.search(r"<answer>", txt, re.I)
+    if not ans_match:
+        return 0
+    segment = txt[base: ans_match.start()]
+    segment = re.sub(r"<retrieved>.*?</retrieved>", "", segment, flags=re.S | re.I)
+    words = re.findall(r"\w+", segment)
+    return len(words)
+
+def _is_complex(question: str) -> bool:
+    qlow = question.lower()
+    return any(k in qlow for k in COMPLEX_KEYWORDS) or len(qlow.split()) >= 18
 
 
 def _clean(num: str):
@@ -217,7 +329,8 @@ def main(
     wandb_project: Optional[str] = None,
     wandb_run_name: Optional[str] = None,
     max_retries: int = 3,
-    debug: bool = False,  # Add debug flag
+    debug: bool = False,
+    auto_plan_retrieval: bool = True,
 ):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -346,8 +459,16 @@ def main(
     # Process dataset
     recs: List[dict] = []
     total_retrievals = 0
+    total_auto = 0
     
-    for idx, row in enumerate(tqdm(ds, desc="Generating")):
+    for idx, row in enumerate(
+        track(
+            ds,
+            description="Generating",
+            total=len(ds),
+            refresh_per_second=1
+            )
+        ): 
         question = row.get("question", row.get("problem", ""))
         true_answer = row.get("answer", row.get("solution", ""))
         
@@ -360,12 +481,14 @@ def main(
         full_response = ""
         retrieval_history = []
         current_prompt = prompt
+        answer_emitted = False
+        last_retrieval_round = -1
         
         # Generation loop with retrieval
         for attempt in range(max_retries + 1):
             # Create stopping criteria
             stop_criteria = StoppingCriteriaList([StopAfterAnswer(tok)])
-            
+
             # Tokenize input
             inputs = tok(
                 current_prompt,
@@ -374,85 +497,190 @@ def main(
                 truncation=True,
                 max_length=4096,
             ).to(device)
-            
+
             # Generate response
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=max_new,
                     do_sample=False,
-                    # temperature=0.7,
-                    # top_p=0.9,
-                    repetition_penalty=1.05,
                     stopping_criteria=stop_criteria,
                     pad_token_id=tok.pad_token_id,
                     eos_token_id=tok.eos_token_id,
                 )
-            
+
             # Decode generated tokens
             new_tokens = outputs[0, inputs["input_ids"].shape[1]:]
             generated_text = tok.decode(new_tokens, skip_special_tokens=False)
-            
+
+            # Sanitize runaway plain 'search' repetitions (model sometimes loops)
+            generated_text = re.sub(r'(?:\bsearch\b\s*){5,}', '', generated_text, flags=re.I)
+
             if debug and idx < 5:
                 print(f"\nSample {idx}, Attempt {attempt}:")
                 print(f"Generated text preview: {generated_text[:200]}...")
-            
+
+            # Zero-shot PLAN-based automatic retrieval (if model forgot to emit <search>)
+            if auto_plan_retrieval and not retrieval_history and RETRIEVE_TRIGGER not in generated_text:
+                # Accumulate current draft (plan likely at start of generated_text)
+                draft_text = full_response + generated_text
+                m = PLAN_RE.search(draft_text)
+                if m:
+                    plan_block = m.group(1)
+                    unknowns = extract_unknown_items(plan_block)
+                    if unknowns:
+                        auto_query = build_query_from_unknowns(unknowns)
+                        print(f"🔍 Auto retrieval (PLAN UNKNOWN) for sample {idx}: '{auto_query}'")
+                        try:
+                            docs = retriever.search(auto_query, k=search_k)
+                            top_docs = rerank(auto_query, docs, k=k_final)
+                            retrieved_examples = []
+                            for i, doc in enumerate(top_docs):
+                                problem_text = doc.get('problem', '')
+                                solution_text = doc.get('solution', '')
+                                example = f"Example {i+1}: {problem_text}... Solution: {solution_text}..."
+                                retrieved_examples.append(example)
+                            retrieved_text = "\n".join(retrieved_examples)
+                            retrieval_history.append({
+                                "query": auto_query,
+                                "num_docs_retrieved": len(docs),
+                                "num_docs_used": len(top_docs),
+                                "examples": retrieved_examples,
+                                "auto": True,
+                            })
+                            last_retrieval_round = len(retrieval_history)
+                            search_block = f"{RETRIEVE_TRIGGER}{auto_query}{SEARCH_CLOSE}\n"
+                            retrieved_block = f"{RETRIEVED_START}\n{retrieved_text}\n{RETRIEVED_END}\n"
+                            current_prompt += generated_text + search_block + retrieved_block
+                            full_response += generated_text + search_block + retrieved_block
+                            continue  # go to next attempt
+                        except Exception as e:
+                            print(f"⚠️ Auto plan retrieval error: {e}")
+
+            # Hard truncate after first closing </answer> to prevent trailing <search> or noise
+            if "</answer>" in generated_text.lower():
+                pre, _post = re.split(r"</answer>", generated_text, 1, flags=re.I)
+                generated_text = pre + "</answer>"
+                answer_emitted = True
+
             # Check for search trigger
-            if RETRIEVE_TRIGGER in generated_text and attempt < max_retries:
+            if (RETRIEVE_TRIGGER in generated_text) and (not answer_emitted) and attempt < max_retries:
                 parts = generated_text.split(RETRIEVE_TRIGGER, 1)
                 before_search = parts[0]
-                
+
                 if len(parts) > 1 and SEARCH_CLOSE in parts[1]:
                     query_and_after = parts[1].split(SEARCH_CLOSE, 1)
                     search_query = query_and_after[0].strip()
-                    
+
                     if search_query:
                         print(f"🔍 Retrieval {len(retrieval_history)+1} for sample {idx}: '{search_query}'")
-                        
+
                         # Perform retrieval
                         try:
                             docs = retriever.search(search_query, k=search_k)
                             top_docs = rerank(search_query, docs, k=k_final)
-                            
+
                             # Format retrieved content
                             retrieved_examples = []
                             for i, doc in enumerate(top_docs):
-                                problem_text = doc.get('problem', '')[:150]
-                                solution_text = doc.get('solution', '')[:200]
+                                problem_text = doc.get('problem', '')
+                                solution_text = doc.get('solution', '')
                                 example = f"Example {i+1}: {problem_text}... Solution: {solution_text}..."
                                 retrieved_examples.append(example)
-                            
+
                             retrieved_text = "\n".join(retrieved_examples)
-                            
+
                             # Record retrieval
                             retrieval_history.append({
                                 "query": search_query,
                                 "num_docs_retrieved": len(docs),
                                 "num_docs_used": len(top_docs),
-                                "examples": retrieved_examples
+                                "examples": retrieved_examples,
+                                "auto": False,
                             })
-                            
+                            last_retrieval_round = len(retrieval_history)
+
                             # Build continuation
                             search_block = f"{RETRIEVE_TRIGGER}{search_query}{SEARCH_CLOSE}\n"
                             retrieved_block = f"{RETRIEVED_START}\n{retrieved_text}\n{RETRIEVED_END}\n"
-                            
+
                             # Update prompts
                             current_prompt += before_search + search_block + retrieved_block
                             full_response += before_search + search_block + retrieved_block
-                            
+
                             # Continue to next iteration
                             continue
-                            
+
                         except Exception as e:
                             print(f"⚠️ Retrieval error: {e}")
                             # Continue without retrieval
-            
+
             # No retrieval or final attempt
             full_response += generated_text
             break
-        
-        # Extract answer
+
+        # Enforce sufficient reasoning length if answer appeared too early
+        expansion_round = 0
+        while True:
+            predicted_answer = strip_answer(full_response)
+            reason_len = _reasoning_token_count(full_response)
+            reason_after_last = _reasoning_token_count_after_last_retr(full_response)
+            need_expansion = (
+                predicted_answer is not None
+                and (
+                    (len(retrieval_history) > 0 and reason_after_last < MIN_REASON_TOKENS_AFTER_RETR)
+                    or (len(retrieval_history) == 0 and _is_complex(question) and reason_len < MIN_REASON_TOKENS)
+                )
+                and expansion_round < MAX_EXPANSION_ROUNDS
+            )
+            if not need_expansion:
+                break
+
+            if debug and idx < 5:
+                print(f"⚠️ Reasoning too short (total={reason_len}, post_retr={reason_after_last}); forcing expansion round {expansion_round+1}")
+
+            # Remove the premature answer
+            full_response = _strip_last_answer(full_response)
+
+            # Append explicit expansion instruction
+            expansion_instruction = (
+                "\n<reasoning_expand>\n"
+                "Your prior reasoning was too brief. Provide a detailed, step-by-step derivation, "
+                "justifying each transformation. Do NOT output <answer> until the reasoning is complete.\n"
+                "</reasoning_expand>\n"
+            )
+            current_prompt = full_response + expansion_instruction
+
+            # Regenerate continuation (single attempt, no retrieval trigger here)
+            stop_criteria = StoppingCriteriaList([StopAfterAnswer(tok)])
+            inputs = tok(
+                current_prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=4096,
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new,
+                    do_sample=False,
+                    stopping_criteria=stop_criteria,
+                    pad_token_id=tok.pad_token_id,
+                    eos_token_id=tok.eos_token_id,
+                )
+
+            new_tokens = outputs[0, inputs["input_ids"].shape[1]:]
+            continuation = tok.decode(new_tokens, skip_special_tokens=False)
+            continuation = re.sub(r'(?:\bsearch\b\s*){5,}', '', continuation, flags=re.I)
+            full_response += continuation
+            expansion_round += 1
+
+        # Extract final answer after any expansions
         predicted_answer = strip_answer(full_response)
+        if predicted_answer is not None:
+            answer_emitted = True
         
         # Record result
         result = {
@@ -462,19 +690,24 @@ def main(
             "ground_truth": true_answer,
             "raw_response": full_response,
             "num_retrievals": len(retrieval_history),
+            "num_auto_retrievals": sum(1 for h in retrieval_history if h.get("auto")),
+            "reason_tokens_total": _reasoning_token_count(full_response),
+            "reason_tokens_after_last_retr": _reasoning_token_count_after_last_retr(full_response),
             "retrieval_queries": [h["query"] for h in retrieval_history],
             "retrieval_history": retrieval_history,
         }
         recs.append(result)
-        
+
         total_retrievals += len(retrieval_history)
-        
+        total_auto += sum(1 for h in retrieval_history if h.get("auto"))
+
         # Log to W&B
         if wandb_project and len(recs) % 10 == 0:
             wandb.log({
                 "samples_processed": len(recs),
                 "avg_retrievals_per_sample": total_retrievals / len(recs),
                 "samples_with_retrieval": sum(1 for r in recs if r["num_retrievals"] > 0),
+                "auto_retrieval_rate": total_auto / len(recs),
             })
     
     # Save results
@@ -500,6 +733,8 @@ def main(
             "final_samples_with_retrieval": samples_with_retrieval,
             "final_avg_retrievals": avg_retrievals,
             "final_total_retrievals": total_retrievals,
+            "final_total_auto_retrievals": total_auto,
+            "final_auto_retrieval_rate": (total_auto / len(recs)) if recs else 0,
         })
         
         # Save artifact

@@ -1,25 +1,8 @@
-#!/usr/bin/env python
-"""
-run_zero_A1_wandb.py  –  Zero‑shot **Chain‑of‑Thought** baseline (Condition A1)
-================================================================================
-Fully aligned with Llama‑3 chat‑prompt format, robust stop‑condition, and dual‑dataset
-field mapping (GSM8K & MATH).
-
-Key points
------------
-1. **System prompt** reminds the model to wrap thoughts in `<think>` and to close the
-   single `<answer> … </answer>` block.
-2. **StopAfterAnswer** stops when either
-      * the exact `</answer>` token sequence is generated **or**
-      * an `<answer>` that already contains a digit is followed by a newline – this
-        salvages outputs that forget the closing tag without truncating real proofs.
-3. **Extractor** tries closed‑tag → open‑tag tail → last number fallback.
-4. `max_new` default raised to **768** (plenty of head‑room; early‑stop keeps runtime
-   reasonable).
-"""
 from __future__ import annotations
 
 import json, os, re, random
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,0,1,2" 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from pathlib import Path
 from typing import List, Optional
 

@@ -61,6 +61,9 @@ def build_stop_criteria(tokenizer, stop_str: str = STOP_STRING) -> StoppingCrite
     stop_ids = [tokenizer.encode(stop_str, add_special_tokens=False)]
     return StoppingCriteriaList([StopWordsCriteria(stop_ids, tokenizer)])
 
+
+
+
 # 3 · System prompt that drives the Active‑RAG loop
 SYSTEM_PROMPT = """
 You are an expert competition-level mathematician with a large private memory **and**

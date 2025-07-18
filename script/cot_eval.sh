@@ -2,8 +2,8 @@
 set -e
 
 MODEL="meta-llama/Llama-3.1-8B-Instruct"  
-BATCH=6                                        
-MAX_NEW=768                                    
+BATCH=8                                        
+MAX_NEW=1024                                    
 WPROJ="COT_EVAL"                            
 STAMP=$(date +%Y%m%d_%H%M)
 
@@ -13,7 +13,7 @@ run_job () {
   local NAME=$1         
   local DATA=$2        
   echo "===== Running $NAME ====="
-  accelerate launch run_zero_cot.py \
+  python run_zero_cot.py \
       --model_name   "$MODEL" \
       --dataset_path "$DATA" \
       --split        test \
