@@ -27,12 +27,12 @@ from transformers import (
 )
 
 from FlagEmbedding import BGEM3FlagModel
-from BGERetriever_v3 import BGERetriever
+from BGERetriever_v2 import BGERetriever
 
 import wandb
 
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3, 4")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
@@ -85,16 +85,15 @@ class StopOnSearchTag(StoppingCriteria):
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         # append latest token (decoded) to buffer
-        self.buf += self.tok.decode(input_ids[0, -1:],
-                                    skip_special_tokens=True)
+        self.buf += self.tok.decode(input_ids[0, -1:], skip_special_tokens=True)
         # keep memory bounded
         if len(self.buf) > 4000:
             self.buf = self.buf[-4000:]
-        # strict check: need an opening and a closing tag, in that order
-        start = self.buf.rfind(self.open_tag)
-        if start != -1:
+        # stop after the FIRST closed </search>
+        if self.open_tag in self.buf and self.close_tag in self.buf:
+            start = self.buf.find(self.open_tag)
             end = self.buf.find(self.close_tag, start + len(self.open_tag))
-            if end != -1:
+            if start != -1 and end != -1:
                 return True
         return False
 
@@ -138,51 +137,87 @@ def format_passages(docs: List[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Raw context masking & injection helpers
+# ---------------------------------------------------------------------------
+def _mask_text_for_injection(s: str) -> str:
+    """Mask numbers and common answer markers to reduce leakage when injecting raw context."""
+    if not s:
+        return s
+    s = re.sub(r"\b\d+(?:\.\d+)?\b", "#", s)
+    s = s.replace("\\boxed", "").replace("The final answer is", "")
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Format masked raw context for injection (top-3 docs)
+# ---------------------------------------------------------------------------
+def format_raw_context_for_injection(docs: List[dict], max_chars_per_doc: int = 600) -> str:
+    """Format raw retrieved docs for injection, with masking and truncation."""
+    blocks = []
+    for i, d in enumerate(docs[:3]):  # cap to top-3 raw docs
+        title = (d.get("full_problem") or d.get("problem") or d.get("title") or "").strip().replace("\n", " ")
+        txt = get_doc_text(d).strip()
+        if len(txt) > max_chars_per_doc:
+            txt = txt[:max_chars_per_doc] + "…"
+        txt = _mask_text_for_injection(txt)
+        header = f"[Doc {i+1}] {title}" if title else f"[Doc {i+1}]"
+        blocks.append(f"{header}\n{txt}")
+    return "\n\n".join(blocks) if blocks else "(no raw passages)"
+
+# ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 def system_prompt_gsm() -> str:
     return (
-        "You are an expert mathematician. Your goal is to solve correctly with minimal tool use — only search if you truly need external knowledge.\n\n"
-        "Protocol (follow exactly):\n"
-        "1) Work in small, numbered steps. Keep them short and focused.\n"
-        "2) Decide at each step if you can proceed without external knowledge. If YES, continue solving; do NOT emit any search tags.\n"
-        "3) Search ONLY when there is a genuine knowledge gap (e.g., a precise definition/identity, a named theorem/lemma, a standard method outline, or a non‑obvious fact you cannot reliably reconstruct). Do not search for routine arithmetic, basic algebraic manipulation, unit conversions, or straightforward counting that you can derive.\n"
-        "4) If a gap exists, first emit a short JSON in:\n"
-        "   <search_reason>{\"step\":k,\"need\":...,\"why\":...,\"query_intent\":...,\"asked_quantity\":aq}</search_reason>\n"
-        "   Keep it minimal and factual.\n"
-        "5) Immediately after that, emit EXACTLY ONE block:\n"
-        "   <search>High‑quality descriptive query</search>\n"
-        "   Then STOP the turn. Do not continue reasoning in the same message.\n"
-        "6) After I return context, integrate it, verify it matches your need, and continue the derivation to the end.\n"
-        "7) Always finish with: **The final answer is: X**\n\n"
-        "Query style (very important):\n"
-        "• Be descriptive: name the concept AND the goal (e.g., “count multiples with floor(N/k) method; two‑digit range”).\n"
-        "• Prefer canonical math terms; avoid copying instance numbers from the problem (use N,k,… instead).\n"
-        "• Never include equations or answers in the query.\n"
-        "• Examples — Good: “Chinese Remainder Theorem — statement and typical application to congruences”; “Vieta’s formulas — relation between roots and coefficients”.\n"
-        "• Examples — Bad: “The number of multiples of 45 less than 1000 is 22.”; “x = …”.\n"
+        "You are an expert mathematician that solves problems step-by-step while minimizing tool use.\n"
+        "Follow this protocol exactly; violations are errors.\n\n"
+        "== PROBLEM DECOMPOSITION (First Turn Only) ==\n"
+        "Before starting the action loop, your first output must be a structured breakdown of the problem:\n"
+        "1. **Variables:** List every number given in the problem and what it represents.\n"
+        "2. **Goal:** State precisely what the question is asking you to find, including the units.\n"
+        "3. **Plan:** Write a numbered, step-by-step plan of the calculations needed to get from the variables to the goal.\n\n"
+        "== ACTION LOOP (Subsequent Turns) ==\n"
+        "After the decomposition, at each step k, do three things:\n"
+        "1) REASON (short): Execute the next step of your plan. Show your work.\n"
+        "2) SANITY CHECK: Before deciding, quickly check if your result is logical. If it seems nonsensical (e.g., negative distance, a part is larger than the whole), state the error and announce that you will revise your plan or re-read the problem in the next step.\n"
+        "3) DECIDE (gap check): Search ONLY if you need a precise statement/definition/identity, a named theorem/lemma, or a standard method outline you cannot confidently reconstruct. Do NOT search for routine arithmetic/algebra, unit conversions, floor/ceil counting, or facts you can derive.\n"
+        "4) ACT: If no gap and the sanity check passes, continue. If there is a gap or a sanity check failure, emit a control block and STOP this turn.\n\n"
+        "== CONTROL GRAMMAR (machine-parsable) ==\n"
+        "Emit exactly one block per step:\n"
+        "<control>{\"step\":k,\"action\":\"continue\"|\"search\"|\"finish\",\"need_type\":null|\"definition\"|\"identity\"|\"named_theorem\"|\"method_outline\",\"can_derive\":true|false,\"confidence_0_1\":0.0,\"why\":\"minimal reason\",\"query\":null|\"used only when action='search'\",\"query_alternatives\":[\"opt1\",\"opt2\"],\"chosen_idx\":0,\"asked_quantity\":\"what is being asked (type/units)\"}</control>\n"
+        "If action=\"search\", immediately follow with EXACTLY ONE:\n<search>Descriptive canonical query; name concept + goal; no equations or instance numbers.</search>\nThen STOP.\n\n"
+        "== QUERY STYLE ==\n"
+        "Name the canonical concept + goal (e.g., 'Chinese Remainder Theorem — statement and simple application'). Avoid copying instance numbers; never include equations or answers.\n\n"
+        "== EVIDENCE INTEGRATION (next turn) ==\n"
+        "Verify snippets match your need; list only useful statements; continue derivation succinctly.\n\n"
+        "== FINISHING ==\n"
+        "When you have the numeric result for the asked quantity, emit: **The final answer is: X**\n\n"
+        "== BENCH_POLICY: GSM8K ==\n"
+        "Treat most content as derivable; search rarely and only for named statements you cannot reconstruct.\n"
     )
 
 
 def system_prompt_math() -> str:
     return (
-        "You are an expert mathematician solving competition problems rigorously. Solve directly unless a precise external reference is required.\n\n"
-        "Protocol (follow exactly):\n"
-        "1) Derive the solution in small, numbered steps; cite relevant ideas clearly.\n"
-        "2) If you can proceed without external knowledge, continue — do NOT emit search tags.\n"
-        "3) Search ONLY when you need a precise statement/definition/identity, a named theorem/lemma, or a standard method outline you cannot reliably reconstruct.\n"
-        "4) When a gap exists, first emit:\n"
-        "   <search_reason>{\"step\":k,\"need\":...,\"why\":...,\"query_intent\":...,\"asked_quantity\":aq}</search_reason>\n"
-        "5) Then emit EXACTLY ONE block:\n"
-        "   <search>The exact theorem/lemma or concept you need (descriptive)</search>\n"
-        "   Then STOP the turn. Do not continue reasoning in the same message.\n"
-        "6) After I return distilled context (or a short raw snippet), verify it addresses the gap and synthesize the next steps to reach the conclusion.\n"
-        "7) Conclude with: **The final answer is: ...**\n\n"
-        "Query style (very important):\n"
-        "• Be descriptive: concept + goal (e.g., “angle bisector theorem — statement and application to inradius”).\n"
-        "• Prefer canonical math terms; avoid copying instance numbers (use N,k,… instead).\n"
-        "• Never include equations or answers in the query.\n"
-        "• Good: “Pigeonhole principle — typical formulations and strategy for bounding counts”. Bad: “Solve the problem for me”, “x=…”.\n"
+        "You are an expert mathematician solving competition problems rigorously, with minimal tool use.\n"
+        "Follow this protocol exactly; violations are errors.\n\n"
+        "== ACTION LOOP ==\n"
+        "At each step k, do three things:\n"
+        "1) REASON (short).\n"
+        "2) DECIDE (gap check): Search ONLY for a precise theorem/lemma/identity/definition or standard method outline you cannot confidently reconstruct.\n"
+        "3) ACT: No gap → continue. Gap → emit <control>{…}</control>, then one <search>…</search> and STOP this turn.\n\n"
+        "== CONTROL GRAMMAR (machine-parsable) ==\n"
+        "<control>{\"step\":k,\"action\":\"continue\"|\"search\"|\"finish\",\"need_type\":null|\"definition\"|\"identity\"|\"named_theorem\"|\"method_outline\",\"can_derive\":true|false,\"confidence_0_1\":0.0,\"why\":\"minimal reason\",\"query\":null|\"used only when action='search'\",\"query_alternatives\":[\"opt1\",\"opt2\"],\"chosen_idx\":0,\"asked_quantity\":\"what is being asked (type/units)\"}</control>\n"
+        "If action=\"search\", immediately follow with EXACTLY ONE:\n<search>Descriptive canonical query; name concept + goal; no equations or instance numbers.</search>\nThen STOP.\n\n"
+        "== QUERY STYLE ==\n"
+        "Use canonical names (e.g., 'Vieta\\'s formulas — relation between roots and coefficients', 'Angle bisector theorem — statement and application to inradius', 'Inclusion–exclusion — standard formulation'). No equations or answers.\n\n"
+        "== INTEGRATION & FINISH ==\n"
+        "Integrate only the necessary statements; proceed to a correct solution.\n\n"
+        "== RIGOR & VERIFICATION ==\n"
+        "After a complex calculation (e.g., back-substitution in EEA, applying a multi-part formula), briefly pause to double-check the arithmetic. Before finishing, quickly review all steps to ensure they logically cohere and satisfy all problem constraints.\n\n"
+        "When you have the final numeric answer, finish with **The final answer is: X**\n\n"
+        "== BENCH_POLICY: MATH ==\n"
+        "Search is allowed for exact statements and method outlines when you cannot reconstruct them confidently; otherwise derive.\n"
     )
 
 
@@ -270,16 +305,14 @@ def extract_final_answer_text(reasoning: str) -> Optional[str]:
 def normalize_final_answer(ans_text: str) -> str:
     """
     Normalize a raw final-answer text to a comparison-friendly string.
-    - Remove currency, commas, percent signs
-    - Preserve simple fractions like 216/5
-    - Fall back to the first numeric token if present
+    Prefer robust cleaning (handles \boxed and \frac) before regex fallback.
     """
-    s = (ans_text or "").strip()
-    s = s.replace(',', '').replace('$', '').replace('%', '')
+    ca = clean_answer(ans_text or "")
+    if ca:
+        return ca
+    s = (ans_text or "").strip().replace(',', '').replace('$', '').replace('%', '')
     m = re.search(r'([-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', s)
-    if m:
-        return m.group(1)
-    return s
+    return m.group(1) if m else s
 
 # ---------------------------------------------------------------------------
 # Generation helpers
@@ -307,7 +340,19 @@ def generate_with_stop(model, tokenizer, prompt: str, max_new_tokens: int, stop_
 
 
 SEARCH_OPEN, SEARCH_CLOSE = "<search>", "</search>"
+CONTROL_OPEN, CONTROL_CLOSE = "<control>", "</control>"
 REASON_OPEN, REASON_CLOSE = "<search_reason>", "</search_reason>"
+def parse_control_block(text: str) -> Tuple[Optional[str], str]:
+    """Return (control_text, cleaned_text_without_control). If no block, control=None."""
+    if CONTROL_OPEN not in text:
+        return None, text
+    start = text.rfind(CONTROL_OPEN)
+    end = text.find(CONTROL_CLOSE, start + len(CONTROL_OPEN))
+    if start == -1 or end == -1:
+        return None, text
+    control = text[start + len(CONTROL_OPEN): end].strip()
+    cleaned = (text[:start] + text[end + len(CONTROL_CLOSE):]).strip()
+    return control, cleaned
 
 def parse_reason_block(text: str) -> Tuple[Optional[str], str]:
     """Return (reason_text, cleaned_text_without_reason_block). If no block, reason=None."""
@@ -334,6 +379,14 @@ def parse_search_block(text: str) -> Tuple[Optional[str], str]:
     query = text[start + len(SEARCH_OPEN): end].strip()
     cleaned = (text[:start] + text[end + len(SEARCH_CLOSE):]).strip()
     return query, cleaned
+
+def normalize_control_json(obj: Optional[dict]) -> Optional[dict]:
+    if not isinstance(obj, dict):
+        return obj
+    # Normalize common typos
+    if "confidence_1.0" in obj and "confidence_0_1" not in obj:
+        obj["confidence_0_1"] = obj.pop("confidence_1.0")
+    return obj
 
 # ---------------------------------------------------------------------------
 # Cross-encoder
@@ -365,41 +418,6 @@ def cross_encoder_rescore(query: str, docs: List[dict], cross_encoder, final_k: 
 # ---------------------------------------------------------------------------
 # Retrieval distillation (summary + how to proceed)
 # ---------------------------------------------------------------------------
-def summarize_context(problem: str,
-                      query: str,
-                      docs: List[dict],
-                      model,
-                      tokenizer,
-                      k_final: int,
-                      max_new_tokens: int = 256) -> str:
-    """
-    Produce a compact summary of ONLY the relevant statements/identities/definitions from the retrieved docs
-    and a short plan for how to continue the solution. Avoid copying long text or instance-specific numbers.
-    """
-    # Build compact snippets to keep prompt small
-    snippets: List[str] = []
-    for d in docs[:k_final]:
-        title = d.get("question", d.get("problem", d.get(
-            "title", ""))).replace("\n", " ").strip()
-        txt = get_doc_text(d).replace("\n", " ").strip()
-        if len(txt) > 420:
-            txt = txt[:420] + "…"
-        snippets.append(f"- {title}\n  {txt}")
-    sys = (
-        "You distill math references for an LLM solving a problem.\n"
-        "From the snippets and the problem, extract only the useful statements/identities/definitions in bullet points.\n"
-        "Then add a short 'Next steps' section (1–2 bullets) describing how to proceed in this problem.\n"
-        "Avoid copying long passages or unrelated details. Do not include equations with instance-specific numbers."
-    )
-    usr = (
-        f"Problem:\n{problem}\n\n"
-        f"Search query:\n{query}\n\n"
-        "Retrieved snippets:\n" + "\n".join(snippets)
-    )
-    prompt = build_llama_prompt(sys, usr)
-    out = generate_with_stop(
-        model, tokenizer, prompt, max_new_tokens=max_new_tokens, stop_for_search=False)
-    return out.strip()
 
 # ---------------------------------------------------------------------------
 # Core solve loop
@@ -437,46 +455,74 @@ def solve(problem: str,
         )
         transcript.append(gen)
 
-        # Extract reason first (if any), then the search tag; keep both for logging but strip them from continuation
-        reason_text, text_wo_reason = parse_reason_block(gen)
+        # Extract control/reason first (if any), then the search tag; keep both for logging but strip them from continuation
+        control_text, text_wo_control = parse_control_block(gen)
+        reason_text, text_wo_reason = parse_reason_block(text_wo_control)
         query, cleaned_text = parse_search_block(text_wo_reason)
 
         if query is not None:
             tool_calls += 1
             retrieval_attempts += 1
-            # Parse the search_reason JSON if present (optional)
+
+            # Parse control JSON if present; otherwise fall back to <search_reason>
             reason_info = None
-            if reason_text:
+            if control_text:
+                try:
+                    reason_info = json.loads(control_text)
+                except Exception:
+                    reason_info = {"raw_control": control_text}
+            elif reason_text:
                 try:
                     reason_info = json.loads(reason_text)
                 except Exception:
                     reason_info = {"raw": reason_text}
 
+            reason_info = normalize_control_json(reason_info) if reason_info else None
+
+            skip_due_to_derivable = False
+            if bench == "gsm8k" and isinstance(reason_info, dict) and reason_info.get("can_derive") is True:
+                skip_due_to_derivable = True
+
             original_query = query
             search_query: str = original_query
 
-            docs = retriever.search_and_rerank(search_query, top_k=k_dense, top_k_final=k_final ) if retriever else []
-            # top = rerank_colbert(query, docs, getattr(
-            #     retriever, "rerank_model", None), k_final)
-            # qscore = float(sum(d.get("rerank_score", 0.0) for d in top))
+            # Run retrieval (unless derivable on GSM)
+            docs = []
+            if retriever and not skip_due_to_derivable:
+                docs = retriever.search_and_rerank(
+                    search_query,
+                    top_k=k_dense,
+                    top_k_final=k_final,
+                )
+            ctx_raw_inject = format_passages(docs)
 
+            # Telemetry from retriever if available
+            rinfo = getattr(retriever, "get_last_search_info", lambda: {})() if retriever else {}
 
-            ctx_raw_full = format_passages(docs)  # for logging
-            # ctx_summary = summarize_context(
-            #     problem, query, top, model, tokenizer, k_final, max_new_tokens=256)
-
-            # Trace (log both raw and summary for analysis)
+            # Trace (log raw context + telemetry)
             trace.append({
-                "query": query,
-                "original_query": search_query,
+                "query": search_query,
                 "search_reason": reason_info,
-                "ctx": ctx_raw_full,
+                "ctx_raw": ctx_raw_inject,
                 "num_docs_found": len(docs),
+                "retrieval_info": rinfo,
+                "skipped_due_to_derivable": skip_due_to_derivable,
             })
 
+            # Provide only raw evidence to the model
+            if not skip_due_to_derivable:
+                prompt = append_block(prompt, "user", f"Retrieved evidence (raw, masked numbers):\n{ctx_raw_inject}")
+                # If retrieval looked weak, gently nudge a rewrite on next turn
+                if rinfo.get("low_confidence"):
+                    prompt = append_block(
+                        prompt,
+                        "system",
+                        "Retrieval appears weak. If needed, rewrite the query with canonical concept names and emit another <search>. Otherwise continue solving succinctly."
+                    )
+
+            # Also append any assistant continuation that followed the search tag
             if cleaned_text:
                 prompt = append_block(prompt, "assistant", cleaned_text)
-
 
             retrieval_executed += 1
         else:
@@ -486,8 +532,7 @@ def solve(problem: str,
                 # One-shot verification: ensure target/units match the question; fix if needed
                 verify_prompt = append_block(
                     prompt, "system",
-                    "Before finalizing, restate the exact quantity asked and check that your result matches its type/units and constraints. "
-                    "If there is any discrepancy, correct the calculation. Then output ONLY: **The final answer is: X**"
+                    "Before finalizing: (1) Restate the exact quantity asked. (2) Check units/type (integer vs fraction vs real; sign; range). (3) Do a 1-line dimensional/invariants check (e.g., time=distance/rate; position on a line with signs for directions). (4) Ensure no step used instance numbers copied from retrieved text. If anything mismatches, correct it briefly. Then output ONLY: **The final answer is: X**"
                 )
                 verify_out = generate_with_stop(
                     model, tokenizer, verify_prompt,
@@ -541,7 +586,6 @@ def solve(problem: str,
         "retrieval_attempted": retrieval_attempts > 0,
         "retrieval_executed": retrieval_executed > 0,
         "retrieval_triggered": retrieval_executed > 0,
-        "queries_generated": trace,
         "injections_made": trace,
         "total_steps": len(trace) + 1,
     }
@@ -572,10 +616,8 @@ def run_benchmark(
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
     dataset_path: Optional[str] = None,
     num_samples: Optional[int] = -1,
-    faiss_index: Optional[str] = "/local00/student/shakya/bge_m3_faiss.index",
-    faiss_meta: Optional[str] = "/local00/student/shakya/chunk_metadata.jsonl",
-    example_map_path: Optional[str] = "data/openmathinstruct2/example_id_to_data.json",
-    chunk_texts_path: Optional[str] = "/local00/student/shakya/chunk_texts.json",
+    faiss_index: Optional[str] = "/local00/student/shakya/openmath_bge-m3_hnsw_index",
+    faiss_meta: Optional[str] = "/local00/student/shakya/openmath_bge-m3_metadata.jsonl",
     k_dense: int = 100,
     k_final: int = 5,
     allow_gpu8bit: bool = True,
@@ -618,12 +660,8 @@ def run_benchmark(
         emb_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
         retriever = BGERetriever(
             embedding_model=emb_model,
-            index_path=faiss_index,                     # ✅ use FAISS index
-            metadata_path=faiss_meta,             # ✅ use JSONL with text
-            example_map_path=example_map_path,        # same as before
-            nprobe=64,
-            use_all_gpus=True,
-            chunk_texts_path=chunk_texts_path,              # ✅ optional but helps reranker
+            index_path=faiss_index,                    
+            metadata_path=faiss_meta,            
         )
     else:
         console.print(
@@ -638,6 +676,12 @@ def run_benchmark(
         ))
     else:
         console.print("[grey62]W&B disabled[/grey62]")
+
+    # Benchmark-specific runtime defaults
+    if benchmark == "math":
+        # Limit to a single tool turn to avoid duplicate searches in one problem
+        if max_tool_calls > 1:
+            max_tool_calls = 1
 
     console.print(
         f"[bold blue]Solving {len(ds)} {benchmark.upper()} problems…[/bold blue]")
@@ -691,7 +735,7 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 def analyze_results(file: str,
                     print_examples: int = 0,
-                    save_csv: bool = False,
+                    save_csv: bool = True,
                     csv_path: Optional[str] = None):
     """
     Analyze a results JSON produced by run_benchmark and print a compact summary.
