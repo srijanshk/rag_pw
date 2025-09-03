@@ -1,38 +1,40 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 import os
+from random import random
 import re
 import json
 import glob
 import logging
-import random
-import csv
-import statistics as st
+import math
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from contextlib import contextmanager
+import gc
 
 import torch
+import fire
 from datasets import load_dataset
 from rich.console import Console
 from rich.progress import track
 
 from transformers import (
-    AutoTokenizer,
     AutoModelForCausalLM,
-    BitsAndBytesConfig,
+    AutoTokenizer,
     StoppingCriteria,
     StoppingCriteriaList,
+    BitsAndBytesConfig
 )
 
 from FlagEmbedding import BGEM3FlagModel
+from vllm import SamplingParams
 from BGERetriever_v2 import BGERetriever
 
 import wandb
 
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3, 4")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3,4")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
@@ -69,61 +71,35 @@ def append_block(prompt: str, role: str, content: str) -> str:
     return prompt + f"<|start_header_id|>{role}<|end_header_id|>\n{content.strip()}\n<|eot_id|>\n"
 
 # ---------------------------------------------------------------------------
-# Custom stopping criteria: halt at the first well-formed <search>...</search>
+# Header tokens: stop & sanitize
 # ---------------------------------------------------------------------------
-class StopOnSearchTag(StoppingCriteria):
-    """Stop generation once a complete <search>...</search> block is closed.
 
-    We look for the literal strings "<search>" and "</search>" in a rolling buffer.
-    """
-    def __init__(self, tokenizer, open_tag: str = "<search>", close_tag: str = "</search>"):
+def sanitize_headers(text: str) -> str:
+    """Remove Llama chat header tokens that sometimes leak into generations."""
+    if not text:
+        return text
+    return text.strip()
+
+# ---------------------------------------------------------------------------
+# Custom stopping criteria: halt on ANY specified tag
+# ---------------------------------------------------------------------------
+class StopOnTag(StoppingCriteria):
+    """Stop generation once a complete specified tag block is closed."""
+    def __init__(self, tokenizer, stop_tags: List[str]):
         super().__init__()
         self.tok = tokenizer
-        self.open_tag = open_tag
-        self.close_tag = close_tag
+        self.stop_sequences = [f"</{tag}>" for tag in stop_tags]
         self.buf = ""
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        # append latest token (decoded) to buffer
         self.buf += self.tok.decode(input_ids[0, -1:], skip_special_tokens=True)
-        # keep memory bounded
-        if len(self.buf) > 4000:
-            self.buf = self.buf[-4000:]
-        # stop after the FIRST closed </search>
-        if self.open_tag in self.buf and self.close_tag in self.buf:
-            start = self.buf.find(self.open_tag)
-            end = self.buf.find(self.close_tag, start + len(self.open_tag))
-            if start != -1 and end != -1:
+        # Keep buffer size manageable
+        if len(self.buf) > 100:
+            self.buf = self.buf[-100:]
+        for seq in self.stop_sequences:
+            if seq in self.buf:
                 return True
         return False
-
-# ---------------------------------------------------------------------------
-# Retrieval helpers (no truncation)
-# ---------------------------------------------------------------------------
-def colbert_scores_safe(query: str, docs: List[dict], model: BGEM3FlagModel, batch_pairs: int = 16) -> List[float]:
-    pairs = [[query, d.get("solution_chunk") or d.get("text", "")]
-             for d in docs]
-    scores: List[float] = []
-    for i in range(0, len(pairs), batch_pairs):
-        try:
-            with suppress_tqdm():
-                chunk_scores = model.compute_score(
-                    pairs[i:i+batch_pairs], batch_size=batch_pairs)["colbert"]
-        except RuntimeError:
-            logging.warning(
-                "ColBERT OOM on docs %d–%d; fallback dense_score", i, i+batch_pairs-1)
-            chunk_scores = [d.get("dense_score", 0.0)
-                            for d in docs[i:i+batch_pairs]]
-        scores.extend(float(s) for s in chunk_scores)
-    return scores
-
-def rerank_colbert(query: str, docs: List[dict], model: Optional[BGEM3FlagModel], top_k: int) -> List[dict]:
-    if not docs or model is None:
-        return docs[:top_k]
-    scores = colbert_scores_safe(query, docs, model)
-    for d, s in zip(docs, scores):
-        d["rerank_score"] = s
-    return sorted(docs, key=lambda d: d["rerank_score"], reverse=True)[:top_k]
 
 def format_passages(docs: List[dict]) -> str:
     lines = []
@@ -137,92 +113,152 @@ def format_passages(docs: List[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Raw context masking & injection helpers
+# Query normalisation helpers (remove LaTeX, very long numbers)
 # ---------------------------------------------------------------------------
-def _mask_text_for_injection(s: str) -> str:
-    """Mask numbers and common answer markers to reduce leakage when injecting raw context."""
-    if not s:
-        return s
-    s = re.sub(r"\b\d+(?:\.\d+)?\b", "#", s)
-    s = s.replace("\\boxed", "").replace("The final answer is", "")
-    return s
+_LATEX_CLEAN_RE = re.compile(r'\\boxed\{[^}]*\}|\\[a-zA-Z]+|[$]')
+_LONG_NUM_RE = re.compile(r'\b\d{5,}\b')
+
+def normalize_search_query(q: str) -> str:
+    """
+    Strip distracting LaTeX fragments and collapse spaces, but PRESERVE numbers
+    and essential structure for a targeted search query.
+    """
+    # Remove LaTeX commands like \frac, \pmod, etc., and dollar signs
+    q = re.sub(r'\\[a-zA-Z]+', ' ', q)
+    q = q.replace('$', '')
+    q = q.replace('{', '').replace('}', '')
+
+    # Collapse multiple spaces into one and lowercase
+    q = re.sub(r'\s+', ' ', q).strip()
+    return q.lower()
+
+SYSTEM_PROMPT = r"""
+You are a careful math problem solver who may consult a knowledge base. Follow the tags and loop below precisely. Do not invent new tags.
+
+Main Loop:
+<interpret>…</interpret> → <plan>…</plan> → <execute>…</execute> → <verify>…</verify> → <reflect_and_decide>…</reflect_and_decide> → [if SEARCH: <query_intent>…</query_intent> + <search>…</search>] → … → <answer>…</answer>
+
+1) <interpret>
+- Givens: list key symbols/constraints (include numeric values if provided; keep it concise).
+- Goal: state the exact requested quantity AND the required answer form (e.g., integer / reduced-fraction / decimal / expression / choice / tuple / text label).
+- Rephrase: one sentence capturing the core question.
+- Constraints: extract 1–2 short constraint tokens to reuse in a search query if needed (e.g., j+k=n; x=0, y>0; gcd(a,m)=1; modulo m; quadrant).
+
+2) <plan> (2–4 bullets)
+- Method: name the primary method family (e.g., modular arithmetic, combinatorics, inequalities, calculus).
+- Steps: outline concrete substeps to reach the goal.
+- If a named identity/theorem/algorithm is needed and you are not ≥0.8 confident you recall it exactly, add the phrase “needs formula”.
+- Answer Form: restate the exact output form (e.g., tuple (r, θ), reduced fraction, symbolic expression) to be produced in <answer>.
+
+3) <execute>
+- Perform exactly ONE step from <plan> with clean symbolic work line-by-line.
+
+4) <verify>
+- Premise Check: confirm sources of all facts used (givens / algebra / recalled theorem).
+- Calculation Check: recompute a key transformation (inverse step or quick sanity bound).
+- Logic Check: confirm the method still targets the goal.
+- End with “Confidence: High / Medium / Low”. (“High” means ≥0.8.)
+
+5) <reflect_and_decide>
+- Analysis: briefly describe your situation (on track / stuck / missing canonical formula/definition/algorithm).
+- Output exactly one: <decision>SEARCH</decision> or <decision>CONTINUE</decision>.
+- Mandate: If “needs formula” is present anywhere above and Confidence is not High, choose SEARCH.
+- Rationale: one sentence why (e.g., “Confidence low; need exact statement of binomial theorem” or “Verification passed; proceed.”)
+ - Policy: Choose SEARCH only when a specific named identity/definition/algorithm is missing or uncertain; if remaining steps are routine algebra/arithmetic, choose CONTINUE.
+
+6) Search (only if you decided SEARCH)
+- (Optional but recommended) add <query_intent>theorem|definition|algorithm|worked-example|fact</query_intent>.
+- Produce exactly one query:
+  <search>your_query_phrase</search>
+  Query rules:
+  • 3–8 tokens; lowercase; noun phrase; no problem‑specific numbers; hyphens allowed; no questions.
+  • Include ONE method/theorem/algorithm keyword AND 1–2 constraint tokens from the problem (variable relations or domain), e.g., x=0, y>0, gcd(a,m)=1, j+k=n, modulo m, quadrant.
+  • Avoid vague fillers like: case, values, expression, problem, compute, find, show.
+  • Do not search for routine arithmetic/algebraic manipulation; only search for missing canonical identities/definitions/algorithms.
+  • Must include at least ONE token from your <interpret> Constraints.
+  Good: <search>divisor count formula exponents</search>
+  Good: <search>polar coordinates angle x=0 y>0</search>
+  Good: <search>count pairs j+k=n double sum</search>
+  Bad:  <search>distinct values from parenthesized expressions</search>
+  Bad:  <search>how do i find inverse mod 83?</search>
+
+— Tool behavior after <search> —
+The system will respond with:
+<retrieval>
+  <search>…</search>
+  <context>
+    …method summary or brief excerpt…
+  </context>
+</retrieval>
+and a follow-up instruction asking you to write <analysis> and <plan> that integrate the context.
+
+7) Assess and integrate (only after a <context> arrives)
+- Write exactly the two tags the instruction requests:
+  <analysis>…</analysis>
+  <plan>…</plan>
+Guidance for <analysis>:
+  • Classify the context: Directly Applicable / Related Example / Conceptual Overview / Irrelevant.
+  • Extract ONE key relation in abstract symbols only (e.g., ax+by=gcd(a,b); (a+b)^n=Σ C(n,k)a^{n-k}b^k).
+  • Note essential preconditions (e.g., gcd(a,m)=1; n∈ℕ; |x|<1).
+  • Ignore any numeric instance-level answers or example-specific constants in the context; keep only abstract statements.
+  • If irrelevant, write exactly UNHELPFUL.
+Guidance for <plan>:
+  • Revise the plan minimally: specify where this plugs in (e.g., “Step 2: apply identity, then compare coefficients of x^r”).
+  • If ignoring, say why and state the next step.
+If you wrote UNHELPFUL above, output exactly one improved search using METHOD+CONSTRAINT tokens and stop:
+  <search>better_phrase</search>
+Otherwise, continue with <plan> and then <execute>.
+
+8) Final Answer
+- Do not output <answer> until the verification is “Confidence: High” AND the required form stated in <interpret> is met.
+- The final line must be exactly one tag containing only the value in the required form, with no extra text:
+  <answer>VALUE</answer>
+  Normalization rules:
+  • Integers/decimals: strip commas; strip trailing zeros in decimals (drop dot if integer-valued).
+  • Fractions: reduce; ensure denominator > 0; collapse /1 to integer.
+  • Tuples: use parentheses and a comma+space, e.g., (a, b).
+  • Choices/text labels: output exactly the symbol or label (e.g., A or Evelyn) with no punctuation.
+  • Expressions: simplest correct symbolic form without surrounding prose.
+  • If the required answer is a tuple or expression, output the full form; do not collapse to a single numeric component.
+"""
+
+INTEGRATE_PROMPT = r"""
+A search was performed based on your last step. Analyze and integrate the results.
+
+<retrieved_knowledge>
+{injected_text}
+</retrieved_knowledge>
+
+<analysis>
+1) Relevance: does this match the declared <query_intent>? If NO, write exactly UNHELPFUL and stop.
+2) Method & Key Relation: give ONE canonical method name and ONE core relation in abstract symbols only.
+3) Preconditions: note essential conditions (e.g., gcd(a,m)=1; n∈ℕ; |x|<1).
+4) Conflict Check: any contradiction with your current plan/algebra?
+5) Impact: Continue (using it) / Revise plan / Ignore.
+Important: Ignore any final numeric answers or example-specific constants in the evidence; keep only abstract statements and identities.
+Before continuing, restate the method once using THIS problem’s variables (no numeric values).
+</analysis>
+
+<plan>
+Write a revised plan from this point (1–3 bullets). If ignoring, say why and state the next step.
+Then continue with <execute> applying the method at the exact substep you identified.
+</plan>
+"""
+
+SUMMARY_SYSTEM_PROMPT = r"""
+Extract a SINGLE reusable method (definition/theorem/algorithm) in abstract variables.
+- Give one canonical method name (aliases optional in parentheses).
+- Include ONE key relation in symbols (letters like a,b,m,n; numerals like 0 or 1 allowed).
+- Optionally add a short precondition clause (e.g., “gcd(a,m)=1”).
+- No problem-specific numbers, examples, or multi-step derivations.
+- Output ONE sentence. If no clear method, output UNHELPFUL.
+"""
 
 
-# ---------------------------------------------------------------------------
-# Format masked raw context for injection (top-3 docs)
-# ---------------------------------------------------------------------------
-def format_raw_context_for_injection(docs: List[dict], max_chars_per_doc: int = 600) -> str:
-    """Format raw retrieved docs for injection, with masking and truncation."""
-    blocks = []
-    for i, d in enumerate(docs[:3]):  # cap to top-3 raw docs
-        title = (d.get("full_problem") or d.get("problem") or d.get("title") or "").strip().replace("\n", " ")
-        txt = get_doc_text(d).strip()
-        if len(txt) > max_chars_per_doc:
-            txt = txt[:max_chars_per_doc] + "…"
-        txt = _mask_text_for_injection(txt)
-        header = f"[Doc {i+1}] {title}" if title else f"[Doc {i+1}]"
-        blocks.append(f"{header}\n{txt}")
-    return "\n\n".join(blocks) if blocks else "(no raw passages)"
 
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-def system_prompt_gsm() -> str:
-    return (
-        "You are an expert mathematician that solves problems step-by-step while minimizing tool use.\n"
-        "Follow this protocol exactly; violations are errors.\n\n"
-        "== PROBLEM DECOMPOSITION (First Turn Only) ==\n"
-        "Before starting the action loop, your first output must be a structured breakdown of the problem:\n"
-        "1. **Variables:** List every number given in the problem and what it represents.\n"
-        "2. **Goal:** State precisely what the question is asking you to find, including the units.\n"
-        "3. **Plan:** Write a numbered, step-by-step plan of the calculations needed to get from the variables to the goal.\n\n"
-        "== ACTION LOOP (Subsequent Turns) ==\n"
-        "After the decomposition, at each step k, do three things:\n"
-        "1) REASON (short): Execute the next step of your plan. Show your work.\n"
-        "2) SANITY CHECK: Before deciding, quickly check if your result is logical. If it seems nonsensical (e.g., negative distance, a part is larger than the whole), state the error and announce that you will revise your plan or re-read the problem in the next step.\n"
-        "3) DECIDE (gap check): Search ONLY if you need a precise statement/definition/identity, a named theorem/lemma, or a standard method outline you cannot confidently reconstruct. Do NOT search for routine arithmetic/algebra, unit conversions, floor/ceil counting, or facts you can derive.\n"
-        "4) ACT: If no gap and the sanity check passes, continue. If there is a gap or a sanity check failure, emit a control block and STOP this turn.\n\n"
-        "== CONTROL GRAMMAR (machine-parsable) ==\n"
-        "Emit exactly one block per step:\n"
-        "<control>{\"step\":k,\"action\":\"continue\"|\"search\"|\"finish\",\"need_type\":null|\"definition\"|\"identity\"|\"named_theorem\"|\"method_outline\",\"can_derive\":true|false,\"confidence_0_1\":0.0,\"why\":\"minimal reason\",\"query\":null|\"used only when action='search'\",\"query_alternatives\":[\"opt1\",\"opt2\"],\"chosen_idx\":0,\"asked_quantity\":\"what is being asked (type/units)\"}</control>\n"
-        "If action=\"search\", immediately follow with EXACTLY ONE:\n<search>Descriptive canonical query; name concept + goal; no equations or instance numbers.</search>\nThen STOP.\n\n"
-        "== QUERY STYLE ==\n"
-        "Name the canonical concept + goal (e.g., 'Chinese Remainder Theorem — statement and simple application'). Avoid copying instance numbers; never include equations or answers.\n\n"
-        "== EVIDENCE INTEGRATION (next turn) ==\n"
-        "Verify snippets match your need; list only useful statements; continue derivation succinctly.\n\n"
-        "== FINISHING ==\n"
-        "When you have the numeric result for the asked quantity, emit: **The final answer is: X**\n\n"
-        "== BENCH_POLICY: GSM8K ==\n"
-        "Treat most content as derivable; search rarely and only for named statements you cannot reconstruct.\n"
-    )
-
-
-def system_prompt_math() -> str:
-    return (
-        "You are an expert mathematician solving competition problems rigorously, with minimal tool use.\n"
-        "Follow this protocol exactly; violations are errors.\n\n"
-        "== ACTION LOOP ==\n"
-        "At each step k, do three things:\n"
-        "1) REASON (short).\n"
-        "2) DECIDE (gap check): Search ONLY for a precise theorem/lemma/identity/definition or standard method outline you cannot confidently reconstruct.\n"
-        "3) ACT: No gap → continue. Gap → emit <control>{…}</control>, then one <search>…</search> and STOP this turn.\n\n"
-        "== CONTROL GRAMMAR (machine-parsable) ==\n"
-        "<control>{\"step\":k,\"action\":\"continue\"|\"search\"|\"finish\",\"need_type\":null|\"definition\"|\"identity\"|\"named_theorem\"|\"method_outline\",\"can_derive\":true|false,\"confidence_0_1\":0.0,\"why\":\"minimal reason\",\"query\":null|\"used only when action='search'\",\"query_alternatives\":[\"opt1\",\"opt2\"],\"chosen_idx\":0,\"asked_quantity\":\"what is being asked (type/units)\"}</control>\n"
-        "If action=\"search\", immediately follow with EXACTLY ONE:\n<search>Descriptive canonical query; name concept + goal; no equations or instance numbers.</search>\nThen STOP.\n\n"
-        "== QUERY STYLE ==\n"
-        "Use canonical names (e.g., 'Vieta\\'s formulas — relation between roots and coefficients', 'Angle bisector theorem — statement and application to inradius', 'Inclusion–exclusion — standard formulation'). No equations or answers.\n\n"
-        "== INTEGRATION & FINISH ==\n"
-        "Integrate only the necessary statements; proceed to a correct solution.\n\n"
-        "== RIGOR & VERIFICATION ==\n"
-        "After a complex calculation (e.g., back-substitution in EEA, applying a multi-part formula), briefly pause to double-check the arithmetic. Before finishing, quickly review all steps to ensure they logically cohere and satisfy all problem constraints.\n\n"
-        "When you have the final numeric answer, finish with **The final answer is: X**\n\n"
-        "== BENCH_POLICY: MATH ==\n"
-        "Search is allowed for exact statements and method outlines when you cannot reconstruct them confidently; otherwise derive.\n"
-    )
-
-
-def get_system_prompt(bench: str) -> str:
-    return system_prompt_gsm() if bench == "gsm8k" else system_prompt_math()
+def get_system_prompt(_: str = "") -> str:
+    """Return the single unified prompt (bench argument kept for call‑site compatibility)."""
+    return SYSTEM_PROMPT
 # ---------------------------------------------------------------------------
 # Answer extraction helpers
 # ---------------------------------------------------------------------------
@@ -233,160 +269,162 @@ def _latex_frac_to_str(s: str) -> Optional[str]:
     return None
 
 def clean_answer(a: str) -> Optional[str]:
+    """
+    Extract a numeric answer (integer, decimal, or fraction) from an <answer> block.
+    Robust to wrappers such as 'Final Answer:', '\boxed{...}', extra symbols, etc.
+    Returns a canonical string like '123', '3.5', or '7/11', or None if not found.
+    """
     if not a:
         return None
-    a = a.strip()
-    a = re.sub(r"^\$?\\boxed\{([^}]*)\}\$?$", r"\1", a)
-    frac = _latex_frac_to_str(a)
-    if frac:
-        return frac
-    a = re.sub(r"^[^\d\-]+", "", a)
-    frac = _latex_frac_to_str(a)
-    if frac:
-        return frac
-    if re.fullmatch(r"-?\d+/\d+", a):
-        return a
-    if re.fullmatch(r"-?\d+(?:\.\d+)?", a):
-        return a
-    return None
+    s = a.strip()
 
-def extract_answer(text: str) -> Optional[str]:
-    if not text:
-        return None
-    patterns = [
-        r"final answer is[:\s]*([^\.\n]+)",
-        r"\\boxed\{([^}]+)\}",
-        r"answer[:\s]*([^\.\n]+)",
-    ]
-    for p in patterns:
-        m = re.search(p, text, flags=re.I)
-        if m:
-            cand = clean_answer(m.group(1))
-            if cand:
-                return cand
-    m = re.search(r"\\frac\{(-?\d+)\}\{(-?\d+)\}", text)
+    # Remove leaked header tokens and repeated <answer> tags
+    s = re.sub(r'<\|[^>]*\|>', '', s)
+    s = re.sub(r'<answer>[^<]*</answer>\s*<answer>', '<answer>', s, flags=re.S)
+
+    # Remove common verbal wrappers (case-insensitive)
+    s = re.sub(r'(?i)\bfinal\s*answer\b\s*[:\-]?\s*', '', s)
+    s = re.sub(r'(?i)\banswer\b\s*[:\-]?\s*', '', s)
+
+    # Unwrap any \boxed{...} occurrences anywhere in the string
+    s = re.sub(r'\\boxed\{([^}]*)\}', r'\1', s)
+
+    # Remove currency/percent and stray LaTeX $ markers and commas
+    s = s.replace(',', '')
+    s = s.replace('$', '')
+    s = s.replace('%', '')
+    s = s.strip()
+
+    # Prefer a LaTeX \frac{a}{b} anywhere in the string
+    m_frac = re.search(r'\\frac\{(-?\d+)\}\{(-?\d+)\}', s)
+    if m_frac:
+        return f"{m_frac.group(1)}/{m_frac.group(2)}"
+
+    # Pull the first simple fraction OR decimal OR integer token
+    m = re.search(r'[-+]?\d+(?:/\d+|\.\d+)?', s)
     if m:
-        return f"{m.group(1)}/{m.group(2)}"
-    tokens = re.findall(r"-?\d+/\d+|-?\d+(?:\.\d+)?", text)
-    if tokens:
-        fracs = [t for t in tokens if "/" in t]
-        return clean_answer(fracs[-1] if fracs else tokens[-1])
+        return m.group(0)
+
     return None
 
 # ---------------------------------------------------------------------------
 # Final-answer extraction & normalization (robust)
 # ---------------------------------------------------------------------------
-FINAL_ANSWER_PATTERNS = [
-    re.compile(
-        r'\*\*?\s*The\s+final\s+answer\s+is\s*:\s*(.+?)\s*\*\*', re.IGNORECASE),
-    re.compile(
-        r'(?:^|\n)\s*The\s+final\s+answer\s+is\s*:\s*(.+?)(?:\n|$)', re.IGNORECASE),
-    re.compile(
-        r'(?:^|\n)\s*final\s*answer\s*[:\-–]\s*(.+?)(?:\n|$)', re.IGNORECASE),
-]
-
-def extract_final_answer_text(reasoning: str) -> Optional[str]:
-    """
-    Find the LAST occurrence of a 'final answer' declaration and return the raw text after the colon.
-    Handles bold markdown and plain text. Returns None if not found.
-    """
-    last = None
-    for pat in FINAL_ANSWER_PATTERNS:
-        for m in pat.finditer(reasoning or ""):
-            cand = (m.group(1) or "").strip()
-            # only keep the current line and strip trailing fmt marks
-            cand = cand.splitlines()[0].strip()
-            cand = re.sub(r'[\s`*]+$', '', cand)
-            if cand:
-                last = cand
-    return last
-
-
 def normalize_final_answer(ans_text: str) -> str:
     """
     Normalize a raw final-answer text to a comparison-friendly string.
-    Prefer robust cleaning (handles \boxed and \frac) before regex fallback.
+    - Extracts a numeric from messy wrappers via clean_answer (with regex fallback).
+    - Reduces fractions to lowest terms and collapses /1.
+    - Trims trailing zeros in decimals and drops the dot if integer-valued.
     """
-    ca = clean_answer(ans_text or "")
-    if ca:
-        return ca
-    s = (ans_text or "").strip().replace(',', '').replace('$', '').replace('%', '')
-    m = re.search(r'([-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', s)
-    return m.group(1) if m else s
+    s = clean_answer(ans_text or "")
+    if not s:
+        s = (ans_text or "").strip().replace(',', '').replace('$', '').replace('%', '')
+        m = re.search(r'([-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', s)
+        s = m.group(1) if m else s
+
+    # If it's a fraction, reduce it
+    if re.fullmatch(r"-?\d+/-?\d+", s):
+        num_str, den_str = s.split('/')
+        num, den = int(num_str), int(den_str)
+        if den != 0:
+            g = math.gcd(num, den)
+            num //= g
+            den //= g
+            # Normalize sign to denominator > 0
+            if den < 0:
+                den = -den
+                num = -num
+            if den == 1:
+                return str(num)
+            return f"{num}/{den}"
+
+    # If decimal, strip trailing zeros and drop the dot if integer-valued
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        ip, fp = s.split('.', 1)
+        fp = fp.rstrip('0')
+        if fp == "":
+            return ip
+        return f"{ip}.{fp}"
+
+    return s
 
 # ---------------------------------------------------------------------------
 # Generation helpers
 # ---------------------------------------------------------------------------
-def generate_with_stop(model, tokenizer, prompt: str, max_new_tokens: int, stop_for_search: bool) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt",
-                       truncation=False).to(model.device)
-    stopping = None
-    if stop_for_search:
-        stopping = StoppingCriteriaList([StopOnSearchTag(tokenizer)])
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=0.1,
-            top_p=0.9,
-            repetition_penalty=1.05,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            stopping_criteria=stopping,
+def generate_with_stop(
+    model,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int,
+    stop_tags: List[str],
+    temperature: float = 0.1,
+) -> str:
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=False).to(model.device)
+    stopping_criteria = StoppingCriteriaList([StopOnTag(tokenizer, stop_tags)])
+
+    try:
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=0.9,
+                repetition_penalty=1.05,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                use_cache=True,
+                stopping_criteria=stopping_criteria,
+                return_dict_in_generate=False,
+            )
+        gen = tokenizer.decode(
+            out[0, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True
         )
-    gen = tokenizer.decode(
-        out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    return gen.strip()
+        return gen.strip()
+    finally:
+        # Aggressive cleanup of per-call tensors
+        try:
+            del inputs
+        except Exception:
+            pass
+        try:
+            del out
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
 
-SEARCH_OPEN, SEARCH_CLOSE = "<search>", "</search>"
-CONTROL_OPEN, CONTROL_CLOSE = "<control>", "</control>"
-REASON_OPEN, REASON_CLOSE = "<search_reason>", "</search_reason>"
-def parse_control_block(text: str) -> Tuple[Optional[str], str]:
-    """Return (control_text, cleaned_text_without_control). If no block, control=None."""
-    if CONTROL_OPEN not in text:
-        return None, text
-    start = text.rfind(CONTROL_OPEN)
-    end = text.find(CONTROL_CLOSE, start + len(CONTROL_OPEN))
-    if start == -1 or end == -1:
-        return None, text
-    control = text[start + len(CONTROL_OPEN): end].strip()
-    cleaned = (text[:start] + text[end + len(CONTROL_CLOSE):]).strip()
-    return control, cleaned
 
-def parse_reason_block(text: str) -> Tuple[Optional[str], str]:
-    """Return (reason_text, cleaned_text_without_reason_block). If no block, reason=None."""
-    if REASON_OPEN not in text:
-        return None, text
-    start = text.rfind(REASON_OPEN)
-    end = text.find(REASON_CLOSE, start + len(REASON_OPEN))
-    if start == -1 or end == -1:
-        return None, text
-    reason = text[start + len(REASON_OPEN): end].strip()
-    cleaned = (text[:start] + text[end + len(REASON_CLOSE):]).strip()
-    return reason, cleaned
+def generate_with_stop_vllm(
+    engine, prompt: str, max_new_tokens: int, stop_tags, temperature: float = 0.1, seed: int = 123
+) -> str:
+    stop = [f"</{t}>" for t in stop_tags]           # e.g., ["</search>", "</answer>"]
+    params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=0.9,
+        repetition_penalty=1.05,
+        stop=stop,
+        seed=seed,
+    )
+    out = engine.generate([prompt], params)
+    return out[0].outputs[0].text.strip()
 
 
-def parse_search_block(text: str) -> Tuple[Optional[str], str]:
-    """Return (query, cleaned_text_without_block). If no block, query=None."""
-    if SEARCH_OPEN not in text:
+def parse_tag(text: str, tag: str) -> Tuple[Optional[str], str]:
+    """Extracts content from the first complete tag block, e.g., <tag>content</tag>."""
+    open_tag, close_tag = f"<{tag}>", f"</{tag}>"
+    # Regex to grab the first complete block non-greedily
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", text, flags=re.S)
+    if not m:
         return None, text
-    # find last opening tag to avoid partial earlier ones
-    start = text.rfind(SEARCH_OPEN)
-    end = text.find(SEARCH_CLOSE, start + len(SEARCH_OPEN))
-    if start == -1 or end == -1:
-        return None, text
-    query = text[start + len(SEARCH_OPEN): end].strip()
-    cleaned = (text[:start] + text[end + len(SEARCH_CLOSE):]).strip()
-    return query, cleaned
-
-def normalize_control_json(obj: Optional[dict]) -> Optional[dict]:
-    if not isinstance(obj, dict):
-        return obj
-    # Normalize common typos
-    if "confidence_1.0" in obj and "confidence_0_1" not in obj:
-        obj["confidence_0_1"] = obj.pop("confidence_1.0")
-    return obj
+    content = (m.group(1) or "").strip()
+    cleaned_text = (text[:m.start()] + text[m.end():]).strip()
+    return content, cleaned_text
 
 # ---------------------------------------------------------------------------
 # Cross-encoder
@@ -395,199 +433,339 @@ def get_doc_text(d: dict) -> str:
     return d.get("solution_chunk") or d.get("solution") or d.get("text", "")
 
 
-def cross_encoder_rescore(query: str, docs: List[dict], cross_encoder, final_k: int, batch_size: int = 16) -> List[dict]:
-    """Rescore provided docs with a cross-encoder and return top final_k docs."""
-    if not cross_encoder or not docs:
-        return docs[:final_k]
-    pairs = [[query, get_doc_text(d)] for d in docs]
-    scores: List[float] = []
-    for i in range(0, len(pairs), batch_size):
-        with suppress_tqdm():
-            try:
-                # FlagReranker returns a list of floats
-                sc = cross_encoder.compute_score(
-                    pairs[i:i+batch_size], batch_size=batch_size)
-            except Exception:
-                sc = [0.0] * len(pairs[i:i+batch_size])
-        scores.extend(float(s) for s in sc)
-    for d, s in zip(docs, scores):
-        d["ce_score"] = s
-    return sorted(docs, key=lambda d: d.get("ce_score", 0.0), reverse=True)[:final_k]
-
-
 # ---------------------------------------------------------------------------
-# Retrieval distillation (summary + how to proceed)
+# Context summarization (method-only injection)
 # ---------------------------------------------------------------------------
+
+def summarize_context_with_llm(
+    model,
+    tokenizer,
+    query: str,
+    context_str: str,
+    problem: Optional[str] = None,
+    reasoning_so_far: Optional[str] = None,
+    max_new_tokens: int = 1024,
+    temperature: float = 0.3,
+) -> str:
+
+    # Short-circuit if nothing useful to summarize
+    if not context_str or not context_str.strip():
+        return ""
+
+    # Local helpers -------------------------------------------------------
+    def _sanitize_reasoning(s: str) -> str:
+        # Drop leaked answers or control tags that could steer generation
+        s = re.sub(r"<answer>.*?</answer>", "", s, flags=re.S | re.I)
+        s = re.sub(r"(?i)final\s*answer\s*[:\-]?", "", s)
+        s = re.sub(r"<search>.*?</search>", "", s, flags=re.S | re.I)
+        s = s.replace("<|begin_of_text|>", "").replace("<|eot_id|>", "")
+        return s.strip()
+
+    def _postprocess(summary: str) -> str:
+        # Enforce no answers and avoid repeated whitespace; NO word-cap truncation
+        summary = re.sub(r"<answer>.*?</answer>", "", summary, flags=re.S | re.I)
+        summary = re.sub(r"(?i)final\s*answer\s*[:\-]?", "", summary)
+        summary = re.sub(r"[ \t]+\n", "\n", summary)
+        return summary.strip()
+
+    problem_snip = problem or ""
+    reasoning_snip = _sanitize_reasoning(reasoning_so_far or "")
+    evidence_snip = context_str
+
+    user = (
+        f"<query>\n{query}\n</query>\n\n"
+        f"<evidence>\n{evidence_snip}\n</evidence>"
+    )
+
+    prompt = build_llama_prompt(SUMMARY_SYSTEM_PROMPT, user)
+
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=0.9,
+                repetition_penalty=1.02,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
+        raw = tokenizer.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        return _postprocess(raw)
+    except Exception:
+        return ""
+
+def summarize_context_with_vllm(
+    model,                      # vLLM LLM engine
+    query: str,
+    context_str: str,
+    problem: Optional[str] = None,
+    reasoning_so_far: Optional[str] = None,
+    max_new_tokens: int = 1024,
+    temperature: float = 0.3,
+) -> str:
+    """
+    Summarize retrieved context into a one-sentence 'method card' using vLLM.
+    Returns a short summary or '' on failure. Matches the original function's API.
+    """
+    import re
+    from vllm import SamplingParams
+
+    # Short-circuit if nothing useful to summarize
+    if not context_str or not context_str.strip():
+        return ""
+
+    # ---- helpers ---------------------------------------------------------
+    def _sanitize_reasoning(s: str) -> str:
+        s = re.sub(r"<answer>.*?</answer>", "", s, flags=re.S | re.I)
+        s = re.sub(r"(?i)\bfinal\s*answer\b\s*[:\-]?", "", s)
+        s = re.sub(r"<search>.*?</search>", "", s, flags=re.S | re.I)
+        s = s.replace("<|begin_of_text|>", "").replace("<|eot_id|>", "")
+        return s.strip()
+
+    def _postprocess(summary: str) -> str:
+        summary = re.sub(r"<answer>.*?</answer>", "", summary, flags=re.S | re.I)
+        summary = re.sub(r"(?i)\bfinal\s*answer\b\s*[:\-]?", "", summary)
+        summary = re.sub(r"[ \t]+\n", "\n", summary)
+        return summary.strip()
+
+    problem_snip = problem or ""
+    reasoning_snip = _sanitize_reasoning(reasoning_so_far or "")
+
+    user = (
+        f"<query>\n{query}\n</query>\n\n"
+        f"<evidence>\n{context_str}\n</evidence>"
+    )
+    prompt = build_llama_prompt(SUMMARY_SYSTEM_PROMPT, user)
+
+    try:
+        params = SamplingParams(
+            max_tokens=int(max_new_tokens),
+            temperature=float(temperature),
+            top_p=0.9,
+            repetition_penalty=1.02,
+            # # light safety stops; harmless if never produced
+            # stop=["<|eot_id|>", "</answer>"],
+            seed=123,
+        )
+        out = model.generate([prompt], params)
+        raw = (out[0].outputs[0].text or "").strip()
+        return _postprocess(raw)
+    except Exception:
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # Core solve loop
 # ---------------------------------------------------------------------------
 def solve(problem: str,
           retriever,
-          model,
+          engine,
           tokenizer,
           bench: str,
           k_dense: int,
           k_final: int,
-          max_tool_calls: int = 2,
+          max_tool_calls: int = 3,
           tool_gen_tokens: int = 512,
           answer_gen_tokens: int = 2048,
+          seed: int = 123,
+          injection_mode: str = "summary",
           ) -> Dict:
 
     sys_prompt = get_system_prompt(bench)
     prompt = build_llama_prompt(sys_prompt, problem)
 
-    tool_calls = 0
-    trace: List[dict] = []
-    final_text = ""
-    turns = 0
     transcript: List[str] = []
-    retrieval_attempts = 0
-    retrieval_executed = 0
+    trace: List[dict] = []
 
-    while turns < max_tool_calls + 1:
-        turns += 1
-        stop_for_search = tool_calls < max_tool_calls
+    retrieval_triggered = False
+    retrieval_executed = False
+    answer_content: Optional[str] = None
+
+    for turn in range(max_tool_calls):
         gen = generate_with_stop(
-            model, tokenizer, prompt,
-            max_new_tokens=tool_gen_tokens if stop_for_search else answer_gen_tokens,
-            stop_for_search=stop_for_search,
+            model=engine,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_new_tokens=tool_gen_tokens,
+            stop_tags=["search", "answer"],
+            temperature=0.1,
         )
+        gen = sanitize_headers(gen)
         transcript.append(gen)
 
-        # Extract control/reason first (if any), then the search tag; keep both for logging but strip them from continuation
-        control_text, text_wo_control = parse_control_block(gen)
-        reason_text, text_wo_reason = parse_reason_block(text_wo_control)
-        query, cleaned_text = parse_search_block(text_wo_reason)
+        ans, cleaned_text_ans = parse_tag(gen, "answer")
+        if ans is not None:
+            inner = (ans or "").strip()
+            if inner:
+                # Accept any non-empty VALUE (number, fraction, tuple, label, expression)
+                answer_content = inner
+                break
+            else:
+                prompt = append_block(
+                    prompt,
+                    "user",
+                    "Format error: The <answer> tag was empty. Please provide a final answer inside the tag.",
+                )
+                continue
 
-        if query is not None:
-            tool_calls += 1
-            retrieval_attempts += 1
+        # Try to capture decision/confidence for this turn
+        # (best-effort; won't affect generation)
+        decision_tag, _ = parse_tag(gen, "decision")
+        verify_block, _ = parse_tag(gen, "verify")
+        confidence_level: Optional[str] = None
+        if verify_block:
+            m_conf = re.search(r"(?i)confidence\s*:\s*(high|medium|low)", verify_block)
+            if m_conf:
+                confidence_level = m_conf.group(1).capitalize()
 
-            # Parse control JSON if present; otherwise fall back to <search_reason>
-            reason_info = None
-            if control_text:
-                try:
-                    reason_info = json.loads(control_text)
-                except Exception:
-                    reason_info = {"raw_control": control_text}
-            elif reason_text:
-                try:
-                    reason_info = json.loads(reason_text)
-                except Exception:
-                    reason_info = {"raw": reason_text}
-
-            reason_info = normalize_control_json(reason_info) if reason_info else None
-
-            skip_due_to_derivable = False
-            if bench == "gsm8k" and isinstance(reason_info, dict) and reason_info.get("can_derive") is True:
-                skip_due_to_derivable = True
-
-            original_query = query
-            search_query: str = original_query
-
-            # Run retrieval (unless derivable on GSM)
+        # Otherwise, check for a search request
+        search_query, cleaned_text_search = parse_tag(gen, "search")
+        if search_query:
+            retrieval_triggered = True
+            retrieval_executed = True
+            query_norm = normalize_search_query(search_query)
             docs = []
-            if retriever and not skip_due_to_derivable:
+            if retriever:
                 docs = retriever.search_and_rerank(
-                    search_query,
+                    query_norm,
                     top_k=k_dense,
                     top_k_final=k_final,
                 )
-            ctx_raw_inject = format_passages(docs)
+            context_str = format_passages(docs)
+            # Minimal per-doc stats for analysis (avoid injecting raw text here)
+            docs_stats = []
+            try:
+                for d in docs:
+                    docs_stats.append({
+                        "id": d.get("id"),
+                        "dense_score": d.get("dense_score"),
+                        "rerank_score": d.get("rerank_score"),
+                        "problem_from": d.get("problem_from"),
+                        "row_id": d.get("row_id"),
+                        "chunk_id": d.get("chunk_id"),
+                    })
+            except Exception:
+                docs_stats = []
+            if injection_mode == "summary":
+                recent_reasoning = "\n\n".join(transcript[-3:]) if transcript else ""
+                method_only = summarize_context_with_llm(
+                    engine,
+                    tokenizer,
+                    query_norm,
+                    context_str,
+                    problem=problem,
+                    reasoning_so_far=recent_reasoning,
+                )
+                inject_text = (method_only or "").strip()
+            else:
+                inject_text = (context_str or "").strip()
 
-            # Telemetry from retriever if available
-            rinfo = getattr(retriever, "get_last_search_info", lambda: {})() if retriever else {}
+            inject_display = inject_text
 
-            # Trace (log raw context + telemetry)
+            transcript.append(
+                "<retrieval>\n"
+                f"<search>{search_query}</search>\n"
+                "<context>\n"
+                f"{inject_display}\n"
+                "</context>\n"
+                "</retrieval>"
+            )
+
             trace.append({
-                "query": search_query,
-                "search_reason": reason_info,
-                "ctx_raw": ctx_raw_inject,
+                "query_raw": search_query,
+                "query": query_norm,
+                "ctx_raw": context_str,
+                "ctx_injected": inject_text,
+                "ctx_injected_preview": inject_display,
                 "num_docs_found": len(docs),
-                "retrieval_info": rinfo,
-                "skipped_due_to_derivable": skip_due_to_derivable,
+                "injection_mode": injection_mode,
+                "decision": (decision_tag or "").strip() if decision_tag else None,
+                "confidence": confidence_level,
+                "docs": docs_stats,
             })
 
-            # Provide only raw evidence to the model
-            if not skip_due_to_derivable:
-                prompt = append_block(prompt, "user", f"Retrieved evidence (raw, masked numbers):\n{ctx_raw_inject}")
-                # If retrieval looked weak, gently nudge a rewrite on next turn
-                if rinfo.get("low_confidence"):
-                    prompt = append_block(
-                        prompt,
-                        "system",
-                        "Retrieval appears weak. If needed, rewrite the query with canonical concept names and emit another <search>. Otherwise continue solving succinctly."
-                    )
-
-            # Also append any assistant continuation that followed the search tag
-            if cleaned_text:
-                prompt = append_block(prompt, "assistant", cleaned_text)
-
-            retrieval_executed += 1
-        else:
-            final_text = cleaned_text if cleaned_text else gen
-            prompt = append_block(prompt, "assistant", final_text)
-            if "final answer is" in final_text.lower():
-                # One-shot verification: ensure target/units match the question; fix if needed
-                verify_prompt = append_block(
-                    prompt, "system",
-                    "Before finalizing: (1) Restate the exact quantity asked. (2) Check units/type (integer vs fraction vs real; sign; range). (3) Do a 1-line dimensional/invariants check (e.g., time=distance/rate; position on a line with signs for directions). (4) Ensure no step used instance numbers copied from retrieved text. If anything mismatches, correct it briefly. Then output ONLY: **The final answer is: X**"
+            if inject_text:
+                injection_prompt = INTEGRATE_PROMPT.format(
+                    injected_text=inject_text,
+                    problem=problem,
                 )
-                verify_out = generate_with_stop(
-                    model, tokenizer, verify_prompt,
-                    max_new_tokens=min(256, answer_gen_tokens // 2),
-                    stop_for_search=False,
+                prompt = append_block(prompt, "user", injection_prompt)
+            else:
+                prompt = append_block(
+                    prompt,
+                    "user",
+                    f"<problem>\n{problem}\n</problem>\n",
                 )
-                prompt = append_block(prompt, "assistant", verify_out)
-                transcript.append(verify_out)
-                final_text = verify_out
-                break
-            prompt = append_block(
-                prompt, "system", "State succinctly: **The final answer is: [value]**")
-            prompt = append_block(prompt, "assistant", "")
             continue
 
-    # append queries used to the reasoning text
-    queries_used = [t["query"] for t in trace]
-    # Stitch full reasoning from all turns (assistant generations and retrieved contexts)
+        # No <answer> and no <search>: carry the text forward and try again
+        if gen.strip():
+            prompt = append_block(prompt, "assistant", gen)
+
+    if answer_content is None:
+        final_shot_prompt = append_block(
+            prompt,
+            "user",
+            (
+                "Your reasoning is stuck. Please output a final answer directly. "
+                "Output exactly one line in the form\n"
+                "<answer>VALUE</answer>\n"
+                "No other text. Do NOT include <think> or <search>. Ensure VALUE matches the required form stated in <interpret>."
+            ),
+        )
+        final_gen = generate_with_stop(
+            model=engine,
+            tokenizer=tokenizer,
+            prompt=final_shot_prompt,
+            max_new_tokens=answer_gen_tokens,
+            stop_tags=["answer"],
+            temperature=0.2,
+        )
+        final_clean = sanitize_headers(final_gen)
+        transcript.append(f"<forced_final_generation>\n{final_clean}\n</forced_final_generation>")
+        ans2, _ = parse_tag(final_clean, "answer")
+        if ans2 is not None:
+            inner2 = (ans2 or "").strip()
+            if inner2:
+                answer_content = inner2
+
+    # Assemble reasoning/output
     full_reasoning_out = "\n\n---\n".join(transcript)
+    queries_used = [t.get("query", t.get("query_raw")) for t in trace]
     if queries_used:
-        full_reasoning_out += "\n\n---\nSearch queries used:\n" + \
-            "\n".join(f"- {q}" for q in queries_used)
+        full_reasoning_out += "\n\n---\nSearch queries used:\n" + "\n".join(f"- {q}" for q in queries_used)
 
-    # Robust final-answer extraction from the full transcript (with fallbacks)
-    pred_text = extract_final_answer_text(full_reasoning_out)
-    predicted_answer = normalize_final_answer(pred_text) if pred_text else None
-    pred_source = "final_tag" if pred_text else None
+    # Derive final predicted answer
+    predicted_answer = None
+    pred_source = None
+    raw_pred_text = None
 
-    # Fallback: try last assistant turn only
-    if predicted_answer is None:
-        legacy_pred_text = extract_final_answer_text(final_text or "")
-        if legacy_pred_text:
-            predicted_answer = normalize_final_answer(legacy_pred_text)
-            pred_text = legacy_pred_text
-        pred_source = pred_source or "final_tag_last_turn"
-
-    # Last-resort guard: take the final numeric token in the overall reasoning if needed
-    if predicted_answer is None:
-        nums = re.findall(
-            r'([-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', full_reasoning_out or "")
-        predicted_answer = nums[-1] if nums else None
-    if predicted_answer is not None and pred_source is None:
-        pred_source = "fallback_numeric"
+    if answer_content is not None:
+        raw_pred_text = answer_content
+        predicted_answer = normalize_final_answer(answer_content)
+        pred_source = "answer_tag"
+    else:
+        # last-resort scrape from transcript
+        nums = re.findall(r'([-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', full_reasoning_out)
+        if nums:
+            raw_pred_text = nums[-1]
+            predicted_answer = normalize_final_answer(raw_pred_text)
+            pred_source = "numeric_fallback"
 
     return {
         "predicted_answer": predicted_answer,
-        "predicted_answer_raw": pred_text,
+        "predicted_answer_raw": raw_pred_text,
         "predicted_answer_source": pred_source,
         "full_reasoning": full_reasoning_out,
         "queries_used": queries_used,
-        "retrieval_attempted": retrieval_attempts > 0,
-        "retrieval_executed": retrieval_executed > 0,
-        "retrieval_triggered": retrieval_executed > 0,
+        "retrieval_attempted": retrieval_executed,
+        "retrieval_executed": retrieval_executed,
+        "retrieval_triggered": retrieval_triggered,
         "injections_made": trace,
-        "total_steps": len(trace) + 1,
+        "retrieval_count": len(trace),
+        "total_steps": len(transcript),
     }
 
 # ---------------------------------------------------------------------------
@@ -610,7 +788,6 @@ def load_split_any(path: str, split: str):
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
-
 def run_benchmark(
     benchmark: str = "gsm8k",
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
@@ -618,41 +795,91 @@ def run_benchmark(
     num_samples: Optional[int] = -1,
     faiss_index: Optional[str] = "/local00/student/shakya/openmath_bge-m3_hnsw_index",
     faiss_meta: Optional[str] = "/local00/student/shakya/openmath_bge-m3_metadata.jsonl",
-    k_dense: int = 100,
+    k_dense: int = 200,
     k_final: int = 5,
-    allow_gpu8bit: bool = True,
     tool_gen_tokens: int = 512,
     answer_gen_tokens: int = 2048,
-    max_tool_calls: int = 2,
+    max_tool_calls: int = 3,
     wandb_project: Optional[str] = None,
     wandb_run: Optional[str] = None,
     out_path: Optional[str] = None,
+    seed: int = 42,
+    injection_mode: str = "summary",
 ):
-
     # dataset discovery ------------------------------------------------------
     if dataset_path is None:
+        hf_map = {
+            "math": "hendrycks/competition_math",
+            "gsm8k": "gsm8k",
+            "math500": "HuggingFaceH4/MATH-500",
+            "math-500": "HuggingFaceH4/MATH-500",
+        }
         root = f"./data/benchmarks/{benchmark}"
-        hf = "hendrycks/competition_math" if benchmark == "math" else "gsm8k"
-        for p in [f"{root}/test.jsonl", root, hf]:
-            if os.path.exists(p) or not p.startswith("."):
+        hf = hf_map.get(benchmark)
+    #     for p in [f"{root}/test.jsonl", root, hf]:
+    #         if os.path.exists(p) or not p.startswith("."):
+    #             dataset_path = p
+    #             break
+    # ds = load_split_any(dataset_path, "test")
+        candidates = [f"{root}/test.jsonl", root]
+        if hf:
+            candidates.append(hf)
+
+        dataset_path = None
+        for p in candidates:
+            if (p.startswith(".") and os.path.exists(p)) or (not p.startswith(".")):
                 dataset_path = p
                 break
+
+        if dataset_path is None:
+            raise ValueError(
+                f"Couldn't resolve dataset for benchmark='{benchmark}'. "
+                f"Pass --dataset_path explicitly."
+            )
+
     ds = load_split_any(dataset_path, "test")
-    if num_samples > 0:
+    if num_samples and num_samples > 0:
         ds = ds.select(range(min(num_samples, len(ds))))
 
+    try:
+        import random as _r
+        _r.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
     # model & tokenizer ------------------------------------------------------
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True, padding_side="right")
     tok.pad_token = tok.eos_token
 
-    quant = BitsAndBytesConfig(load_in_8bit=True) if allow_gpu8bit else None
-    model = AutoModelForCausalLM.from_pretrained(
+    # engine = LLM(
+    #         model=model_name,
+    #         tensor_parallel_size=2,             
+    #         dtype="float16",                   
+    #         max_model_len=64_000,     
+    #         enforce_eager=True,           
+    #         compilation_config={"use_cudagraph": False},        
+    #         enable_chunked_prefill=False,                    
+    #     )
+
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )    
+    engine = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
         torch_dtype=torch.float16,
-        quantization_config=quant,
+        quantization_config=bnb,
+        low_cpu_mem_usage=True,
+        offload_folder="/tmp/offload",  
+        offload_state_dict=True,
     )
-    model.eval()
+    engine.eval()
 
     # retriever --------------------------------------------------------------
     retriever = None
@@ -672,16 +899,10 @@ def run_benchmark(
         wandb.init(project=wandb_project, name=wandb_run, config=dict(
             benchmark=benchmark, model=model_name, k_dense=k_dense, k_final=k_final,
             num_samples=num_samples, tool_gen_tokens=tool_gen_tokens, answer_gen_tokens=answer_gen_tokens,
-            max_tool_calls=max_tool_calls
+            max_tool_calls=max_tool_calls,
         ))
     else:
         console.print("[grey62]W&B disabled[/grey62]")
-
-    # Benchmark-specific runtime defaults
-    if benchmark == "math":
-        # Limit to a single tool turn to avoid duplicate searches in one problem
-        if max_tool_calls > 1:
-            max_tool_calls = 1
 
     console.print(
         f"[bold blue]Solving {len(ds)} {benchmark.upper()} problems…[/bold blue]")
@@ -694,7 +915,7 @@ def run_benchmark(
         out = solve(
             problem=ex[q_key],
             retriever=retriever,
-            model=model,
+            engine=engine,
             tokenizer=tok,
             bench=benchmark,
             k_dense=k_dense,
@@ -702,6 +923,8 @@ def run_benchmark(
             tool_gen_tokens=tool_gen_tokens,
             answer_gen_tokens=answer_gen_tokens,
             max_tool_calls=max_tool_calls,
+            seed=seed,
+            injection_mode=injection_mode,
         )
         out.update({
             "id": i,
@@ -719,8 +942,9 @@ def run_benchmark(
                 "steps": out["total_steps"],
                 "acc": int(clean_answer(ex.get(a_key, "")) == out["predicted_answer"]) if a_key else None,
             })
-
-    out_path = out_path if out_path else f"./results/{benchmark}_streamrag_{date.today().strftime('%Y%m%d_%H%M')}.json"
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_path if out_path else f"./results/{benchmark}_streamrag_{timestamp}.json"
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
@@ -729,115 +953,8 @@ def run_benchmark(
     if wandb and wandb_project:
         wandb.save(out_path)
 
-
-# ---------------------------------------------------------------------------
-# Results analyzer (EM, retrieval stats, simple breakdowns)
-# ---------------------------------------------------------------------------
-def analyze_results(file: str,
-                    print_examples: int = 0,
-                    save_csv: bool = True,
-                    csv_path: Optional[str] = None):
-    """
-    Analyze a results JSON produced by run_benchmark and print a compact summary.
-    Usage: python dynamic_rag.py analyze_results --file path.json
-    """
-    with open(file, "r") as f:
-        data = json.load(f)
-
-    def clean_gt(s: str) -> str:
-        s = (s or "").replace(",", "")
-        s = re.sub(r'####\s*', '', s).strip()
-        m = re.findall(r'([-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', s)
-        return m[-1] if m else s
-
-    n = len(data)
-    em = 0
-    attempted = 0
-    executed = 0
-    final_tag = 0
-    steps = []
-
-    with_exec, without_exec = [], []
-    mistakes = []
-
-    for x in data:
-        gt = clean_gt(x.get("ground_truth", ""))
-        pred = str(x.get("predicted_answer") or "").strip()
-        ok = (gt == pred)
-        em += int(ok)
-        attempted += int(bool(x.get("retrieval_attempted")))
-        executed += int(bool(x.get("retrieval_executed")))
-        final_tag += int(bool(x.get("predicted_answer_raw")))
-        steps.append(x.get("total_steps", 0))
-        (with_exec if x.get("retrieval_executed") else without_exec).append(x)
-        if not ok:
-            mistakes.append({
-                "id": x.get("id"),
-                "question": (x.get("question", "") or "")[:200],
-                "gt": gt,
-                "pred": pred,
-                "retrieval_attempted": x.get("retrieval_attempted"),
-                "retrieval_executed": x.get("retrieval_executed"),
-                "pred_source": x.get("predicted_answer_source"),
-            })
-
-    def em_on(items):
-        return sum(clean_gt(i.get("ground_truth", "")) == str(i.get("predicted_answer") or "").strip()
-                   for i in items)
-
-    em_exec = em_on(with_exec)
-    em_noexec = em_on(without_exec)
-
-    summary = {
-        "n": n,
-        "EM": em,
-        "EM_pct": round(100*em/max(1, n), 1),
-        "retrieval_attempted": attempted,
-        "retrieval_attempted_pct": round(100*attempted/max(1, n), 1),
-        "retrieval_executed": executed,
-        "retrieval_executed_pct": round(100*executed/max(1, n), 1),
-        "final_answer_declared_pct": round(100*final_tag/max(1, n), 1),
-        "avg_steps": round(st.mean(steps), 2) if steps else 0.0,
-        "EM_when_executed": em_exec,
-        "EM_when_executed_pct": round(100*em_exec/max(1, len(with_exec)), 1) if with_exec else None,
-        "EM_when_not_executed": em_noexec,
-        "EM_when_not_executed_pct": round(100*em_noexec/max(1, len(without_exec)), 1) if without_exec else None,
-    }
-
-    print("\n=== Results Summary ===")
-    for k, v in summary.items():
-        print(f"{k}: {v}")
-
-    if print_examples and mistakes:
-        print("\n=== Example mistakes ===")
-        for r in mistakes[:print_examples]:
-            print(f"[id={r['id']}] pred={r['pred']} vs gt={r['gt']} | attempted={r['retrieval_attempted']} executed={r['retrieval_executed']} src={r.get('pred_source')}")
-            print("Q:", r["question"])
-            print("---")
-
-    if save_csv and mistakes:
-        out = csv_path
-        if not out:
-            base = os.path.splitext(os.path.basename(file))[0]
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = os.path.join(os.path.dirname(file), "analysis")
-            os.makedirs(out_dir, exist_ok=True)
-            out = os.path.join(out_dir, f"{base}__mistakes_{stamp}.csv")
-        with open(out, "w", newline="") as wf:
-            writer = csv.DictWriter(wf, fieldnames=list(mistakes[0].keys()))
-            writer.writeheader()
-            writer.writerows(mistakes)
-        print(f"\nSaved mistakes CSV to: {out}")
-
-    return summary
-
-
 # ---------------------------------------------------------------------------
 # Fire CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import fire
-    fire.Fire({
-        "run_benchmark": run_benchmark,
-        "analyze_results": analyze_results,
-    })
+    fire.Fire(run_benchmark)
