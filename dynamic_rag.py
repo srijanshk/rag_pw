@@ -133,127 +133,57 @@ def normalize_search_query(q: str) -> str:
     return q.lower()
 
 SYSTEM_PROMPT = r"""
-You are a careful math problem solver who may consult a knowledge base. Follow the tags and loop below precisely. Do not invent new tags.
+You are an expert mathematician.
 
-Main Loop:
-<interpret>…</interpret> → <plan>…</plan> → <execute>…</execute> → <verify>…</verify> → <reflect_and_decide>…</reflect_and_decide> → [if SEARCH: <query_intent>…</query_intent> + <search>…</search>] → … → <answer>…</answer>
+Think step-by-step to solve the problem. Write every reasoning step inside `<think>...</think>` blocks.
 
-1) <interpret>
-- Givens: list key symbols/constraints (include numeric values if provided; keep it concise).
-- Goal: state the exact requested quantity AND the required answer form (e.g., integer / reduced-fraction / decimal / expression / choice / tuple / text label).
-- Rephrase: one sentence capturing the core question.
-- Constraints: extract 1–2 short constraint tokens to reuse in a search query if needed (e.g., j+k=n; x=0, y>0; gcd(a,m)=1; modulo m; quadrant).
+If you are confident and have solved the problem, end your response with exactly one `<answer>` tag containing the final numeric answer.
 
-2) <plan> (2–4 bullets)
-- Method: name the primary method family (e.g., modular arithmetic, combinatorics, inequalities, calculus).
-- Steps: outline concrete substeps to reach the goal.
-- If a named identity/theorem/algorithm is needed and you are not ≥0.8 confident you recall it exactly, add the phrase “needs formula”.
-- Answer Form: restate the exact output form (e.g., tuple (r, θ), reduced fraction, symbolic expression) to be produced in <answer>.
+**WHEN TO ASK FOR HELP:**
+If you cannot proceed without a specific, named formula, definition, or theorem, ask for it. To do this, end your final `<think>` block and then write a single `<search>` tag with your query.
 
-3) <execute>
-- Perform exactly ONE step from <plan> with clean symbolic work line-by-line.
+**IMPORTANT:** After you write the `<search>` tag, you MUST STOP. Do not write anything else.
 
-4) <verify>
-- Premise Check: confirm sources of all facts used (givens / algebra / recalled theorem).
-- Calculation Check: recompute a key transformation (inverse step or quick sanity bound).
-- Logic Check: confirm the method still targets the goal.
-- End with “Confidence: High / Medium / Low”. (“High” means ≥0.8.)
-
-5) <reflect_and_decide>
-- Analysis: briefly describe your situation (on track / stuck / missing canonical formula/definition/algorithm).
-- Output exactly one: <decision>SEARCH</decision> or <decision>CONTINUE</decision>.
-- Mandate: If “needs formula” is present anywhere above and Confidence is not High, choose SEARCH.
-- Rationale: one sentence why (e.g., “Confidence low; need exact statement of binomial theorem” or “Verification passed; proceed.”)
- - Policy: Choose SEARCH only when a specific named identity/definition/algorithm is missing or uncertain; if remaining steps are routine algebra/arithmetic, choose CONTINUE.
-
-6) Search (only if you decided SEARCH)
-- (Optional but recommended) add <query_intent>theorem|definition|algorithm|worked-example|fact</query_intent>.
-- Produce exactly one query:
-  <search>your_query_phrase</search>
-  Query rules:
-  • 3–8 tokens; lowercase; noun phrase; no problem‑specific numbers; hyphens allowed; no questions.
-  • Include ONE method/theorem/algorithm keyword AND 1–2 constraint tokens from the problem (variable relations or domain), e.g., x=0, y>0, gcd(a,m)=1, j+k=n, modulo m, quadrant.
-  • Avoid vague fillers like: case, values, expression, problem, compute, find, show.
-  • Do not search for routine arithmetic/algebraic manipulation; only search for missing canonical identities/definitions/algorithms.
-  • Must include at least ONE token from your <interpret> Constraints.
-  Good: <search>divisor count formula exponents</search>
-  Good: <search>polar coordinates angle x=0 y>0</search>
-  Good: <search>count pairs j+k=n double sum</search>
-  Bad:  <search>distinct values from parenthesized expressions</search>
-  Bad:  <search>how do i find inverse mod 83?</search>
-
-— Tool behavior after <search> —
-The system will respond with:
-<retrieval>
-  <search>…</search>
-  <context>
-    …method summary or brief excerpt…
-  </context>
-</retrieval>
-and a follow-up instruction asking you to write <analysis> and <plan> that integrate the context.
-
-7) Assess and integrate (only after a <context> arrives)
-- Write exactly the two tags the instruction requests:
-  <analysis>…</analysis>
-  <plan>…</plan>
-Guidance for <analysis>:
-  • Classify the context: Directly Applicable / Related Example / Conceptual Overview / Irrelevant.
-  • Extract ONE key relation in abstract symbols only (e.g., ax+by=gcd(a,b); (a+b)^n=Σ C(n,k)a^{n-k}b^k).
-  • Note essential preconditions (e.g., gcd(a,m)=1; n∈ℕ; |x|<1).
-  • Ignore any numeric instance-level answers or example-specific constants in the context; keep only abstract statements.
-  • If irrelevant, write exactly UNHELPFUL.
-Guidance for <plan>:
-  • Revise the plan minimally: specify where this plugs in (e.g., “Step 2: apply identity, then compare coefficients of x^r”).
-  • If ignoring, say why and state the next step.
-If you wrote UNHELPFUL above, output exactly one improved search using METHOD+CONSTRAINT tokens and stop:
-  <search>better_phrase</search>
-Otherwise, continue with <plan> and then <execute>.
-
-8) Final Answer
-- Do not output <answer> until the verification is “Confidence: High” AND the required form stated in <interpret> is met.
-- The final line must be exactly one tag containing only the value in the required form, with no extra text:
-  <answer>VALUE</answer>
-  Normalization rules:
-  • Integers/decimals: strip commas; strip trailing zeros in decimals (drop dot if integer-valued).
-  • Fractions: reduce; ensure denominator > 0; collapse /1 to integer.
-  • Tuples: use parentheses and a comma+space, e.g., (a, b).
-  • Choices/text labels: output exactly the symbol or label (e.g., A or Evelyn) with no punctuation.
-  • Expressions: simplest correct symbolic form without surrounding prose.
-  • If the required answer is a tuple or expression, output the full form; do not collapse to a single numeric component.
+- The query inside `<search>` should be a concise phrase for the missing concept.
+Good: <search>divisor count formula exponents</search>
+Good: <search>polar coordinates angle x=0 y>0</search>
+Good: <search>count pairs j+k=n double sum</search>
+Bad: <search>distinct values from parenthesized expressions</search>
+Bad: <search>how do i find inverse mod 83?</search>
 """
 
 INTEGRATE_PROMPT = r"""
-A search was performed based on your last step. Analyze and integrate the results.
+You are an expert mathematician continuing to solve a problem.
+
+You previously requested a search because you were missing some information. That information has been retrieved.
 
 <retrieved_knowledge>
 {injected_text}
 </retrieved_knowledge>
 
-<analysis>
-1) Relevance: does this match the declared <query_intent>? If NO, write exactly UNHELPFUL and stop.
-2) Method & Key Relation: give ONE canonical method name and ONE core relation in abstract symbols only.
-3) Preconditions: note essential conditions (e.g., gcd(a,m)=1; n∈ℕ; |x|<1).
-4) Conflict Check: any contradiction with your current plan/algebra?
-5) Impact: Continue (using it) / Revise plan / Ignore.
-Important: Ignore any final numeric answers or example-specific constants in the evidence; keep only abstract statements and identities.
-Before continuing, restate the method once using THIS problem’s variables (no numeric values).
-</analysis>
+Your task is to integrate this new knowledge and continue solving the problem.
 
-<plan>
-Write a revised plan from this point (1–3 bullets). If ignoring, say why and state the next step.
-Then continue with <execute> applying the method at the exact substep you identified.
-</plan>
+Start a new `<think>...</think>` block.
+1.  First, briefly analyze the retrieved knowledge: Is it helpful? What is the key formula or fact?
+2.  Then, continue your step-by-step reasoning from where you left off.
+
+When you have confidently reached the final answer, end your response with exactly one `<answer>` tag.
 """
 
 SUMMARY_SYSTEM_PROMPT = r"""
-Extract a SINGLE reusable method (definition/theorem/algorithm) in abstract variables.
-- Give one canonical method name (aliases optional in parentheses).
-- Include ONE key relation in symbols (letters like a,b,m,n; numerals like 0 or 1 allowed).
-- Optionally add a short precondition clause (e.g., “gcd(a,m)=1”).
-- No problem-specific numbers, examples, or multi-step derivations.
-- Output ONE sentence. If no clear method, output UNHELPFUL.
-"""
+From the following evidence, extract a single, reusable method (definition, theorem, or algorithm) in a canonical, abstract form.
 
+Your output must be a single, concise sentence following these rules:
+- **Structure:** Start with the method's canonical name, followed by its formula in abstract variables, and end with any critical preconditions.
+- **Content:** The formula must use abstract variables (e.g., a, b, n, x) not numbers from the problem.
+- **Format:** Output only the single sentence. If no single canonical method can be extracted, output "UNHELPFUL".
+
+**Good Example:**
+The Binomial Theorem states that for a positive integer n, $(x+a)^n = \sum_{k=0}^{n} \binom{n}{k} x^k a^{n-k}$.
+
+**Bad Example:**
+To solve this, we used the binomial theorem to expand (2x+3)^4.
+"""
 
 
 def get_system_prompt(_: str = "") -> str:

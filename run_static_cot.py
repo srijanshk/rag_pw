@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json, os, re, random
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4" 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -162,6 +163,15 @@ class StopAfterAnswer(StoppingCriteria):
 # ---------------------------------------------------------------------------
 
 def load_split(path: str, split: str):
+    # Support common aliases for HF datasets
+    alias = path.lower()
+    if alias in {"math500", "math-500"}:
+        path = "HuggingFaceH4/MATH-500"
+    elif alias in {"math", "hendrycks/math", "hendrycks/competition_math"}:
+        path = "hendrycks/competition_math"
+    elif alias in {"gsm", "gsm8k"}:
+        path = "gsm8k"
+
     if os.path.exists(path):
         if path.endswith((".json", ".jsonl")):
             return load_dataset("json", data_files={split: path}, split=split)
@@ -195,7 +205,7 @@ def colbert_scores_safe(
     for i in range(0, len(pairs), batch_pairs):
         chunk = pairs[i:i + batch_pairs]
         try:
-            s = model.compute_score(
+            s = model.compute_score_single_device(
                 chunk,
                 batch_size=batch_pairs,
                 max_query_length=128,
@@ -242,14 +252,7 @@ def main(
 
     multi_gpu = int(os.getenv("WORLD_SIZE", "1")) > 1
     print(f"Using {device} with multi-GPU={multi_gpu} for model {model_name}")
-    if multi_gpu:
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-            device_map="auto",
-        )
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
     
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token

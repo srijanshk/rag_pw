@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json, os, re, random
-os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,0,1,2" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4" 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from pathlib import Path
 from typing import List, Optional
@@ -148,6 +148,15 @@ class StopAfterAnswer(StoppingCriteria):
 # ---------------------------------------------------------------------------
 
 def load_split(path: str, split: str):
+    # Support common aliases for HF datasets
+    alias = path.lower()
+    if alias in {"math500", "math-500"}:
+        path = "HuggingFaceH4/MATH-500"
+    elif alias in {"math", "hendrycks/math", "hendrycks/competition_math"}:
+        path = "hendrycks/competition_math"
+    elif alias in {"gsm", "gsm8k"}:
+        path = "gsm8k"
+
     if os.path.exists(path):
         if path.endswith((".json", ".jsonl")):
             return load_dataset("json", data_files={split: path}, split=split)
@@ -191,15 +200,7 @@ def main(
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    multi_gpu = int(os.getenv("WORLD_SIZE", "1")) > 1
-    if multi_gpu:
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-            device_map="auto",
-        )
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
     model.config.pad_token_id = tok.pad_token_id
     model.eval()
 
