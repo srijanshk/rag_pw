@@ -5,7 +5,7 @@ MODEL="meta-llama/Llama-3.1-8B-Instruct"
 BATCH=8                                        
 MAX_NEW=1024                                    
 WPROJ="COT_EVAL"                            
-STAMP=$(date +%Y%m%d_%H%M)
+STAMP=$(date +%Y%m%d_%H%M%S)
 
 mkdir -p logs results
 
@@ -26,7 +26,8 @@ run_job () {
   echo "===== $NAME done ====="
 }
 
-run_job gsm   data/benchmarks/gsm8k
-run_job math  data/benchmarks/math
+# run_job gsm   data/benchmarks/gsm8k
+# run_job math  data/benchmarks/math
+run_job math500 "HuggingFaceH4/MATH-500"
 
 echo "✅ All datasets finished – results are in results/, logs in logs/"
