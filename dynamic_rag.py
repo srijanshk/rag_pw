@@ -298,9 +298,7 @@ def generate_with_stop(
             out = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=0.9,
-                repetition_penalty=1.05,
+                do_sample=False,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
                 use_cache=True,
@@ -520,7 +518,7 @@ def solve(problem: str,
             prompt=prompt,
             max_new_tokens=tool_gen_tokens,
             stop_tags=["search", "answer"],
-            temperature=0.1,
+            temperature=0,
         )
         gen = sanitize_headers(gen)
         transcript.append(gen)
@@ -651,7 +649,7 @@ def solve(problem: str,
             prompt=final_shot_prompt,
             max_new_tokens=answer_gen_tokens,
             stop_tags=["answer"],
-            temperature=0.2,
+            temperature=0,
         )
         final_clean = sanitize_headers(final_gen)
         transcript.append(f"<forced_final_generation>\n{final_clean}\n</forced_final_generation>")
@@ -734,6 +732,7 @@ def run_benchmark(
     wandb_run: Optional[str] = None,
     out_path: Optional[str] = None,
     seed: int = 42,
+    quantize_4bit: bool = False,
     injection_mode: str = "summary",
 ):
     # dataset discovery ------------------------------------------------------
@@ -794,17 +793,19 @@ def run_benchmark(
     #         enable_chunked_prefill=False,                    
     #     )
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )    
+    qcfg = None
+    if quantize_4bit:
+        qcfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
     engine = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
         torch_dtype=torch.float16,
-        quantization_config=bnb,
+        quantization_config=qcfg,
         low_cpu_mem_usage=True,
         offload_folder="/tmp/offload",  
         offload_state_dict=True,
