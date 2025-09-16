@@ -94,6 +94,7 @@ run_job () {
       --tool_gen_tokens   $TOOL_TOK \
       --answer_gen_tokens $ANS_TOK \
       --injection_mode    "$MODE" \
+      --quantize_4bit     False \
       --out_path          "results/dynamic/${TAG}.json" \
       --wandb_project     "$WPROJ" \
       --wandb_run         "${NAME}__${KB}__${MODE}__FULL_SYS_${STAMP}" \
