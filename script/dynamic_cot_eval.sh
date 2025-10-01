@@ -3,7 +3,7 @@ set -euo pipefail
 
 # -------- Model & Project --------
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
-WPROJ="Dynamic_rag_EVAL"
+WPROJ="Dynamic_rag_EVAL_v2"
 STAMP=$(date +%Y%m%d_%H%M)
 
 # -------- Knowledge Bases (choose one or both) --------
@@ -28,12 +28,12 @@ MODES=("raw" "summary")
 K_FINAL=5
 
 # Full system settings
-MAX_TOOL_CALLS=5
+MAX_TOOL_CALLS=3
 
 TOOL_TOK_GSM=512
 ANS_TOK_GSM=2048
-TOOL_TOK_MATH=640
-ANS_TOK_MATH=3072
+TOOL_TOK_MATH=512
+ANS_TOK_MATH=2048
 
 mkdir -p logs results
 
@@ -81,7 +81,7 @@ run_job () {
     KFIN=5
   fi
 
-  local TAG="${NAME}_${KB}_${MODE}_${STAMP}_PROMPT2.0"
+  local TAG="${NAME}_${KB}_${MODE}_${STAMP}_PROMPT"
   echo "===== Running $NAME | KB: $KB | mode: $MODE | k_final: $KFIN ====="
   python dynamic_rag.py \
       --benchmark         "$NAME" \
@@ -95,7 +95,7 @@ run_job () {
       --answer_gen_tokens $ANS_TOK \
       --injection_mode    "$MODE" \
       --quantize_4bit     False \
-      --out_path          "results/dynamic/${TAG}.json" \
+      --out_path          "results/dynamic_v2/${TAG}.json" \
       --wandb_project     "$WPROJ" \
       --wandb_run         "${NAME}__${KB}__${MODE}__FULL_SYS_${STAMP}" \
   |& tee "logs/${TAG}.log"
