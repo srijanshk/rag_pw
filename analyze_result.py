@@ -29,13 +29,28 @@ def _balanced_after(s: str, start_idx: int) -> Optional[str]:
     return None  # unbalanced / not found
 
 
+_LATEX_TEXT_CMD_RE = re.compile(r"\\(?:text|mathrm|operatorname|textbf|textit|textrm|rm)\s*\{([^{}]*)\}")
+
+
 def _extract_last_boxed_content(s: str) -> Optional[str]:
-    """Find the LAST \\boxed{...} and return its balanced content (supports nested braces)."""
+    """Find the LAST \boxed{...} and return its balanced content (supports nested braces)."""
     tag = r'\boxed{'
     j = s.rfind(tag)
     if j == -1:
         return None
     return _balanced_after(s, j + len(tag))
+
+
+def _strip_latex_text_wrappers(s: str) -> str:
+    """Remove simple LaTeX text commands like \text{...} while preserving content."""
+    if not s:
+        return s
+    prev = None
+    out = s
+    while prev != out:
+        prev = out
+        out = _LATEX_TEXT_CMD_RE.sub(lambda m: m.group(1).strip(), out)
+    return out
 
 
 def _normalize_answer(ans: str) -> str:
@@ -64,6 +79,9 @@ def _normalize_answer(ans: str) -> str:
     # 1) otherwise take balanced content from the LAST \boxed{...} if present
     boxed = _extract_last_boxed_content(s0)
     s = boxed if boxed is not None else s0
+
+    # remove simple text wrappers early
+    s = _strip_latex_text_wrappers(s)
 
     # 2) cleanup
     s = s.replace("$", " ")
@@ -109,6 +127,7 @@ def _normalize_answer(ans: str) -> str:
             return t
 
     # 5) non-numeric text answer (keep normalized text)
+    s = _strip_latex_text_wrappers(s)
     return s.lower()
 
 
@@ -235,12 +254,21 @@ def analyze_results(file: str,
     count_without_retrieval = 0
 
     steps = []
+    step_blocks_list: List[int] = []
+    verify_blocks_list: List[int] = []
+    verify_cases = 0
+    verify_success_cases = 0
+    verify_failure_cases = 0
+    verify_success_em = 0
+    revision_blocks_list: List[int] = []
+    result_blocks_list: List[int] = []
     mistakes = []
 
     # Retrieval count & doc-score metrics
     retrieval_counts: List[int] = []
     top_rerank_scores_correct: List[float] = []
     top_rerank_scores_incorrect: List[float] = []
+    retrieval_clusters: Dict[tuple, Dict[str, Any]] = {}
 
     for x in data:
         gt_raw = x.get("ground_truth", "")
@@ -250,6 +278,21 @@ def analyze_results(file: str,
 
         em_total += int(ok)
         steps.append(x.get("total_steps", 0) or 0)
+        step_blocks_list.append(x.get("step_blocks", 0) or 0)
+        verify_blocks = x.get("verify_blocks", 0) or 0
+        verify_blocks_list.append(verify_blocks)
+        revision_blocks_list.append(x.get("revision_blocks", 0) or 0)
+        result_blocks_list.append(x.get("result_blocks", 0) or 0)
+        verification_success_flag = (x.get("verification_success", 0) or 0) > 0
+        verification_failure_flag = (x.get("verification_failure", 0) or 0) > 0
+        if verify_blocks > 0:
+            verify_cases += 1
+            if verification_success_flag:
+                verify_success_cases += 1
+                if ok:
+                    verify_success_em += 1
+            if verification_failure_flag:
+                verify_failure_cases += 1
 
         trig = bool(x.get("retrieval_triggered"))
         att = bool(x.get("retrieval_attempted"))
@@ -267,6 +310,34 @@ def analyze_results(file: str,
             count_without_retrieval += 1
             if ok:
                 em_without_retrieval += 1
+
+        if exe:
+            injections = x.get("injections_made") or []
+            if injections:
+                for inj in injections:
+                    q = inj.get("query") or inj.get("query_raw") or inj.get("query_normalized") or ""
+                    q = (q or "").strip()
+                    ctx = inj.get("ctx_injected_preview") or inj.get("ctx_injected") or inj.get("ctx_raw") or ""
+                    ctx = (ctx or "").strip()
+                    if not ctx:
+                        ctx = "(no injected context)"
+                    if len(ctx) > 240:
+                        ctx = ctx[:240] + "…"
+                    key = (q or "(blank query)", ctx)
+                    bucket = retrieval_clusters.setdefault(key, {"count": 0, "success": 0, "ids": []})
+                    bucket["count"] += 1
+                    if ok:
+                        bucket["success"] += 1
+                    if len(bucket["ids"]) < 5:
+                        bucket["ids"].append(x.get("id"))
+            else:
+                key = ("(no injections)", "(context discarded)")
+                bucket = retrieval_clusters.setdefault(key, {"count": 0, "success": 0, "ids": []})
+                bucket["count"] += 1
+                if ok:
+                    bucket["success"] += 1
+                if len(bucket["ids"]) < 5:
+                    bucket["ids"].append(x.get("id"))
 
         # Retrieval count
         rc = x.get("retrieval_count")
@@ -322,6 +393,15 @@ def analyze_results(file: str,
         "EM without Retrieval (%)": safe_percent(em_without_retrieval, count_without_retrieval),
         "--- Other ---": "",
         "Avg. Steps": round(sum(steps) / n, 2) if n > 0 else 0.0,
+        "Avg. Plan Step Blocks": round(sum(step_blocks_list) / n, 2) if n > 0 else 0.0,
+        "Problems with Verify (%)": safe_percent(sum(1 for v in verify_blocks_list if v > 0), n),
+        "Avg. Verify Blocks": round(sum(verify_blocks_list) / n, 2) if n > 0 else 0.0,
+        "Verification Success Cases (%)": safe_percent(verify_success_cases, n),
+        "Verification Failure Cases (%)": safe_percent(verify_failure_cases, n),
+        "EM after Verification Success": f"{verify_success_em}/{verify_success_cases}" if verify_success_cases else "0/0",
+        "EM after Verification Success (%)": safe_percent(verify_success_em, verify_success_cases),
+        "Problems with Revision (%)": safe_percent(sum(1 for r in revision_blocks_list if r > 0), n),
+        "Problems with Result Summary (%)": safe_percent(sum(1 for r in result_blocks_list if r > 0), n),
         "Avg. Retrieval Count (all)": avg_rc_overall,
         "Avg. Retrieval Count (exec only)": avg_rc_retrieved,
     }
@@ -341,6 +421,16 @@ def analyze_results(file: str,
             print(f"\n{k}")
         else:
             print(f"{k:<25}: {v}")
+
+    if retrieval_clusters:
+        print("\n🔍 === Retrieval Clusters === 🔍")
+        sorted_clusters = sorted(retrieval_clusters.items(), key=lambda kv: kv[1]['count'], reverse=True)
+        for (query, ctx), stats in sorted_clusters[:20]:
+            rate = safe_percent(stats['success'], stats['count'])
+            sample_ids = ', '.join(str(i) for i in stats['ids'] if i is not None) or '—'
+            print(f"\nQuery: {query[:200] if query else '(blank)'}")
+            print(f"Context snippet: {ctx[:200] if ctx else '(none)'}")
+            print(f"Count: {stats['count']} | EM (%): {rate} | Example IDs: {sample_ids}")
 
     if print_examples and mistakes:
         print("\n❌ === Example Mistakes === ❌")

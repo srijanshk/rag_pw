@@ -117,6 +117,41 @@ def format_passages(docs: List[dict]) -> str:
 # ---------------------------------------------------------------------------
 _LATEX_CLEAN_RE = re.compile(r'\\boxed\{[^}]*\}|\\[a-zA-Z]+|[$]')
 _LONG_NUM_RE = re.compile(r'\b\d{5,}\b')
+_LATEX_TEXT_CMD_RE = re.compile(r"\\(?:text|mathrm|operatorname|textbf|textit|textrm|rm)\s*\{([^{}]*)\}")
+
+
+def _extract_last_boxed_content(s: str) -> Optional[str]:
+    """Return the balanced content of the last \boxed{...} block, if any."""
+    tag = '\\boxed{'
+    idx = s.rfind(tag)
+    if idx == -1:
+        return None
+    depth = 1
+    out = []
+    i = idx + len(tag)
+    while i < len(s):
+        ch = s[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return ''.join(out).strip()
+        out.append(ch)
+        i += 1
+    return None
+
+
+def strip_latex_text_wrappers(s: str) -> str:
+    """Remove simple LaTeX text commands like \text{...} while preserving content."""
+    if not s:
+        return s
+    prev = None
+    out = s
+    while prev != out:
+        prev = out
+        out = _LATEX_TEXT_CMD_RE.sub(lambda m: m.group(1).strip(), out)
+    return out
 
 def normalize_search_query(q: str) -> str:
     """
@@ -132,42 +167,61 @@ def normalize_search_query(q: str) -> str:
     q = re.sub(r'\s+', ' ', q).strip()
     return q.lower()
 
-SYSTEM_PROMPT = r"""
+SYSTEM_PROMPT = """
 You are an expert mathematician.
+Think step-by-step.
 
-Think step-by-step to solve the problem. Write every reasoning step inside `<think>...</think>` blocks.
+If you need to look up a formula, definition, or problems, you can use the <search> tool by writing a search query inside the <search> tag like this:
+<search>your search query</search>
 
-If you are confident and have solved the problem, end your response with exactly one `<answer>` tag containing the final numeric answer.
+After retrieval, you may:
+1. Use the information if helpful
+2. Explicitly state "Retrieved information not helpful" and continue without it
 
-**WHEN TO ASK FOR HELP:**
-If you cannot proceed without a specific, named formula, definition, or theorem, ask for it. To do this, end your final `<think>` block and then write a single `<search>` tag with your query.
+After the search results are returned, continue your step-by-step thinking.
 
-**IMPORTANT:** After you write the `<search>` tag, you MUST STOP. Do not write anything else.
-
-- The query inside `<search>` should be a concise phrase for the missing concept.
-Good: <search>divisor count formula exponents</search>
-Good: <search>polar coordinates angle x=0 y>0</search>
-Good: <search>count pairs j+k=n double sum</search>
-Bad: <search>distinct values from parenthesized expressions</search>
-Bad: <search>how do i find inverse mod 83?</search>
+When you are ready to give the final answer, use the <answer> tag like this:
+<answer>your final answer</answer> 
 """
 
-INTEGRATE_PROMPT = r"""
-You are an expert mathematician continuing to solve a problem.
-
-You previously requested a search because you were missing some information. That information has been retrieved.
-
+INTEGRATE_PROMPT = """
+Retrieved information:
 <retrieved_knowledge>
 {injected_text}
 </retrieved_knowledge>
 
-Your task is to integrate this new knowledge and continue solving the problem.
+Strict rules for integration:
+1. Extract the core mathematical principle (e.g., formula or theorem) in abstract terms—ignore specific numbers or examples.
+2. State: 'Applying [principle name]: [abstract formula]'.
+3. Map this to your problem's variables and show step-by-step application.
+4. If the retrieval is not helpful (e.g., irrelevant or too specific), explicitly state 'Retrieval not used' and continue with your original reasoning.
+5. Never copy numbers or solutions—adapt abstractly to avoid errors.
+"""
 
-Start a new `<think>...</think>` block.
-1.  First, briefly analyze the retrieved knowledge: Is it helpful? What is the key formula or fact?
-2.  Then, continue your step-by-step reasoning from where you left off.
+VERIFICATION_PROMPT_TEMPLATE = """
+CRITICAL VERIFICATION: Original problem: {problem}
 
-When you have confidently reached the final answer, end your response with exactly one `<answer>` tag.
+Your tentative answer: <answer>{previous_answer}</answer>
+
+Re-solve from scratch without retrieval:
+1. Restate the problem.
+2. Derive the solution step-by-step using alternative reasoning if possible.
+3. Check for errors in logic, arithmetic, or assumptions.
+4. If the answer matches, output: <answer>{previous_answer}</answer> and say 'VERIFIED'.
+5. If there's an error, output: <answer>NEW_VALUE</answer> and say 'CORRECTION: [brief explanation]'.
+
+Be thorough—show all calculations explicitly.
+"""
+
+CONSISTENCY_PROMPT = """
+You have completed a solution using retrieved information.
+
+Review the transcript above and double-check the final answer {previous_answer} without issuing any new <search> requests.
+
+- If that answer is still correct, respond with exactly one <answer>{previous_answer}</answer>.
+- If you discover an error, briefly correct the reasoning and finish with a single corrected <answer>VALUE</answer>.
+
+Stick to the established <think>/<answer> format and do not retrieve new information.
 """
 
 SUMMARY_SYSTEM_PROMPT = r"""
@@ -206,7 +260,8 @@ def clean_answer(a: str) -> Optional[str]:
     """
     if not a:
         return None
-    s = a.strip()
+    boxed_inner = _extract_last_boxed_content(a)
+    s = (boxed_inner if boxed_inner is not None else a).strip()
 
     # Remove leaked header tokens and repeated <answer> tags
     s = re.sub(r'<\|[^>]*\|>', '', s)
@@ -219,10 +274,14 @@ def clean_answer(a: str) -> Optional[str]:
     # Unwrap any \boxed{...} occurrences anywhere in the string
     s = re.sub(r'\\boxed\{([^}]*)\}', r'\1', s)
 
+    # Remove simple LaTeX text wrappers like \text{...}
+    s = strip_latex_text_wrappers(s)
+
     # Remove currency/percent and stray LaTeX $ markers and commas
     s = s.replace(',', '')
     s = s.replace('$', '')
     s = s.replace('%', '')
+    s = s.replace('####', '')
     s = s.strip()
 
     # Prefer a LaTeX \frac{a}{b} anywhere in the string
@@ -230,10 +289,39 @@ def clean_answer(a: str) -> Optional[str]:
     if m_frac:
         return f"{m_frac.group(1)}/{m_frac.group(2)}"
 
-    # Pull the first simple fraction OR decimal OR integer token
-    m = re.search(r'[-+]?\d+(?:/\d+|\.\d+)?', s)
-    if m:
-        return m.group(0)
+    # Normalize whitespace once for pattern checks
+    s_sp = re.sub(r'\s+', ' ', s).strip()
+
+    # Simple numeric enclosed optionally by parentheses
+    if re.fullmatch(r'\(?[-+]?\d+(?:/\d+|\.\d+)?\)?', s_sp):
+        return s_sp.strip('()')
+
+    # Tuples like (a,b) or (a,b,c)
+    if re.fullmatch(r'\(([^()]*)\)', s_sp) and ',' in s_sp:
+        inner = s_sp[1:-1]
+        inner = inner.replace('\\pi', 'pi').replace('π', 'pi')
+        inner = re.sub(r'\s+', '', inner)
+        return f"({inner})"
+
+    # Complex numbers a+bi or a-bi (allow fractions/decimals)
+    if re.fullmatch(r'[-+]?\d+(?:/\d+|\.\d+)?\s*[+-]\s*\d+(?:/\d+|\.\d+)?i', s_sp):
+        return s_sp.replace(' ', '')
+
+    # Symbolic expressions with sqrt/pi/exponents/bases
+    symbolic_markers = ('sqrt', '\\sqrt', 'π', '\\pi', '^', '_', 'sin', 'cos', 'tan', 'log', 'exp')
+    if any(marker in s_sp for marker in symbolic_markers):
+        s_sym = s_sp.replace('\\pi', 'pi').replace('π', 'pi')
+        s_sym = re.sub(r'\s*\*\s*', '*', s_sym)
+        return s_sym
+
+    # Plain textual answers (names, labels, etc.)
+    if s_sp and not re.search(r'\d', s_sp):
+        return s_sp
+
+    # Pull the last simple fraction OR decimal OR integer token
+    tokens = re.findall(r'[-+]?\d+(?:/\d+|\.\d+)?', s_sp)
+    if tokens:
+        return tokens[-1]
 
     return None
 
@@ -249,7 +337,10 @@ def normalize_final_answer(ans_text: str) -> str:
     """
     s = clean_answer(ans_text or "")
     if not s:
-        s = (ans_text or "").strip().replace(',', '').replace('$', '').replace('%', '')
+        s = (ans_text or "").strip()
+        s = re.sub(r'\\boxed\{([^}]*)\}', r'\1', s)
+        s = strip_latex_text_wrappers(s)
+        s = s.replace(',', '').replace('$', '').replace('%', '')
         m = re.search(r'([-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', s)
         s = m.group(1) if m else s
 
@@ -276,6 +367,12 @@ def normalize_final_answer(ans_text: str) -> str:
         if fp == "":
             return ip
         return f"{ip}.{fp}"
+
+    s = strip_latex_text_wrappers(s).strip()
+
+    # Canonicalize purely textual answers by collapsing whitespace and lowercasing
+    if s and not re.search(r'\d', s):
+        s = re.sub(r'\s+', ' ', s).strip().lower()
 
     return s
 
@@ -510,6 +607,87 @@ def solve(problem: str,
     retrieval_triggered = False
     retrieval_executed = False
     answer_content: Optional[str] = None
+    verification_needed = False
+    verification_requested = False
+    verification_used = False
+    verification_blocks = 0
+    verification_successes = 0
+    verification_failures = 0
+    consistency_used = False
+    consistency_changed = False
+    consistency_raw: Optional[str] = None
+
+    def run_verification_step(current_answer: str) -> Tuple[str, bool]:
+        nonlocal prompt, verification_used, verification_blocks, verification_successes, verification_failures
+
+        prev_answer = (current_answer or "").strip()
+        retry_prompt = VERIFICATION_PROMPT_TEMPLATE.format(
+            problem=problem,
+            previous_answer=prev_answer.replace('{', '{{').replace('}', '}}') or "the current answer"
+        )
+
+        for attempt in range(2):
+            verification_used = True
+            verification_blocks += 1
+
+            prompt = append_block(prompt, "user", retry_prompt)
+            transcript.append(
+                "<verification_request attempt=\"{attempt}\">\n".format(attempt=attempt + 1)
+                + retry_prompt.strip()
+                + "\n</verification_request>"
+            )
+
+            verify_gen = generate_with_stop(
+                model=engine,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_new_tokens=answer_gen_tokens,
+                stop_tags=["answer"],
+                temperature=0,
+            )
+            verify_gen = sanitize_headers(verify_gen)
+
+            transcript.append(
+                "<verification_response attempt=\"{attempt}\">\n".format(attempt=attempt + 1)
+                + verify_gen
+                + "\n</verification_response>"
+            )
+            prompt = append_block(prompt, "assistant", verify_gen)
+
+            ans_verify, _ = parse_tag(verify_gen, "answer")
+            candidate = (ans_verify or "").strip() if ans_verify is not None else ""
+            lower_text = verify_gen.lower()
+            has_digits = bool(re.search(r"\d", candidate))
+
+            if candidate:
+                if candidate == prev_answer:
+                    if "verified" in lower_text:
+                        verification_successes += 1
+                        return candidate, True
+                    else:
+                        retry_prompt = (
+                            "You did not explicitly show a full recomputation or state 'Verified'. "
+                            f"The target answer remains <answer>{prev_answer}</answer>. "
+                            "Re-derive the solution step-by-step, display all arithmetic, and conclude with 'Verified' if it matches."
+                        )
+                        continue
+                else:
+                    if "correction" in lower_text or has_digits:
+                        verification_successes += 1
+                        return candidate, True
+                    retry_prompt = (
+                        f"You proposed a different value <answer>{candidate}</answer> without marking it as a correction. "
+                        "If the answer changes, explicitly say 'Correction', show the recalculated steps, and provide the corrected <answer>."
+                    )
+                    prev_answer = candidate
+                    continue
+
+            retry_prompt = (
+                "Your verification response was incomplete. Recompute from scratch, show the steps, and finish with a single <answer>."
+            )
+
+        verification_failures += 1
+        return current_answer, False
 
     for turn in range(max_tool_calls):
         gen = generate_with_stop(
@@ -527,8 +705,17 @@ def solve(problem: str,
         if ans is not None:
             inner = (ans or "").strip()
             if inner:
-                # Accept any non-empty VALUE (number, fraction, tuple, label, expression)
+                prompt = append_block(prompt, "assistant", gen)
                 answer_content = inner
+                if verification_needed and not verification_requested:
+                    answer_content, verify_ok = run_verification_step(answer_content)
+                    verification_requested = True
+                    verification_needed = False
+                    if not verify_ok:
+                        # mark for potential follow-up by consistency check
+                        pass
+                else:
+                    verification_needed = False
                 break
             else:
                 prompt = append_block(
@@ -537,16 +724,6 @@ def solve(problem: str,
                     "Format error: The <answer> tag was empty. Please provide a final answer inside the tag.",
                 )
                 continue
-
-        # Try to capture decision/confidence for this turn
-        # (best-effort; won't affect generation)
-        decision_tag, _ = parse_tag(gen, "decision")
-        verify_block, _ = parse_tag(gen, "verify")
-        confidence_level: Optional[str] = None
-        if verify_block:
-            m_conf = re.search(r"(?i)confidence\s*:\s*(high|medium|low)", verify_block)
-            if m_conf:
-                confidence_level = m_conf.group(1).capitalize()
 
         # Otherwise, check for a search request
         search_query, cleaned_text_search = parse_tag(gen, "search")
@@ -609,10 +786,11 @@ def solve(problem: str,
                 "ctx_injected_preview": inject_display,
                 "num_docs_found": len(docs),
                 "injection_mode": injection_mode,
-                "decision": (decision_tag or "").strip() if decision_tag else None,
-                "confidence": confidence_level,
                 "docs": docs_stats,
             })
+
+            verification_needed = True
+            verification_requested = False
 
             if inject_text:
                 injection_prompt = INTEGRATE_PROMPT.format(
@@ -658,10 +836,61 @@ def solve(problem: str,
             inner2 = (ans2 or "").strip()
             if inner2:
                 answer_content = inner2
+                prompt = append_block(prompt, "assistant", final_clean)
 
-    # Assemble reasoning/output
-    full_reasoning_out = "\n\n---\n".join(transcript)
+    if retrieval_executed and answer_content and verification_blocks == 0:
+        answer_content, _ = run_verification_step(answer_content)
+        verification_requested = True
+
     queries_used = [t.get("query", t.get("query_raw")) for t in trace]
+
+    # Self-consistency double-check when retrieval informed the solve
+    if retrieval_executed and answer_content:
+        prev_for_prompt = answer_content.strip()
+        prev_for_prompt = prev_for_prompt.replace('{', '{{').replace('}', '}}')
+        consistency_instruction = CONSISTENCY_PROMPT.format(
+            previous_answer=prev_for_prompt or "the current final answer"
+        )
+
+        consistency_prompt = append_block(
+            prompt,
+            "user",
+            consistency_instruction,
+        )
+
+        consistency_gen = generate_with_stop(
+            model=engine,
+            tokenizer=tokenizer,
+            prompt=consistency_prompt,
+            max_new_tokens=answer_gen_tokens,
+            stop_tags=["answer"],
+            temperature=0,
+        )
+        consistency_gen = sanitize_headers(consistency_gen)
+
+        transcript.append(
+            "<consistency_check>\n"
+            f"{consistency_gen}\n"
+            "</consistency_check>"
+        )
+
+        ans_consistency, _ = parse_tag(consistency_gen, "answer")
+        if ans_consistency is not None:
+            candidate = (ans_consistency or "").strip()
+            if candidate:
+                consistency_used = True
+                consistency_raw = candidate
+                prev_norm = normalize_final_answer(answer_content)
+                new_norm = normalize_final_answer(candidate)
+                if new_norm and new_norm != prev_norm:
+                    # Only upgrade the answer if the consistency check explicitly signals a revision
+                    lower_case_gen = consistency_gen.lower()
+                    if any(keyword in lower_case_gen for keyword in ("correct", "mistake", "error", "fix")):
+                        answer_content = candidate
+                        consistency_changed = True
+
+    # Rebuild reasoning/output (may include consistency block)
+    full_reasoning_out = "\n\n---\n".join(transcript)
     if queries_used:
         full_reasoning_out += "\n\n---\nSearch queries used:\n" + "\n".join(f"- {q}" for q in queries_used)
 
@@ -694,6 +923,13 @@ def solve(problem: str,
         "injections_made": trace,
         "retrieval_count": len(trace),
         "total_steps": len(transcript),
+        "verification_used": verification_used,
+        "verification_success": verification_successes,
+        "verification_failure": verification_failures,
+        "verify_blocks": verification_blocks,
+        "consistency_used": consistency_used,
+        "consistency_changed": consistency_changed,
+        "consistency_answer_raw": consistency_raw,
     }
 
 # ---------------------------------------------------------------------------
