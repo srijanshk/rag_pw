@@ -4,7 +4,7 @@ set -e
 MODEL="meta-llama/Llama-3.1-8B-Instruct"  
 BATCH=8                                        
 MAX_NEW=1024                                    
-WPROJ="COT_EVAL"                            
+WPROJ="LLM_EVAL"                            
 STAMP=$(date +%Y%m%d_%H%M%S)
 
 mkdir -p logs results
@@ -17,7 +17,7 @@ run_job () {
       --model_name   "$MODEL" \
       --dataset_path "$DATA" \
       --split        test \
-      --out_path     results/${NAME}_COT_${STAMP}.jsonl \
+      --out_path     results/llm/${NAME}_COT_${STAMP}.jsonl \
       --batch        $BATCH \
       --max_new      $MAX_NEW \
       --wandb_project $WPROJ \
@@ -26,7 +26,7 @@ run_job () {
   echo "===== $NAME done ====="
 }
 
-# run_job gsm   data/benchmarks/gsm8k
+run_job gsm   data/benchmarks/gsm8k
 # run_job math  data/benchmarks/math
 run_job math500 "HuggingFaceH4/MATH-500"
 

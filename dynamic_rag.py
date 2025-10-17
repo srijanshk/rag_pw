@@ -170,6 +170,7 @@ def normalize_search_query(q: str) -> str:
 SYSTEM_PROMPT = """
 You are an expert mathematician.
 Think step-by-step.
+Write every reasoning step inside `<think> … </think>` blocks.
 
 If you need to look up a formula, definition, or problems, you can use the <search> tool by writing a search query inside the <search> tag like this:
 <search>your search query</search>

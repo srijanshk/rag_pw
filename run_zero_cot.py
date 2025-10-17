@@ -36,6 +36,15 @@ SYSTEM_MSG = """
 
     Nothing after `</answer>`.
 """
+SYSTEM_MSG = """
+    You are an expert mathematician.
+
+    Solve the math problem and produce **exactly one**
+
+        <answer> FINAL_NUMERIC_ANSWER </answer>
+
+    Nothing after `</answer>`.
+"""
 
 CHAT_TEMPLATE = (
     "<|begin_of_text|>"
