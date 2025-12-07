@@ -21,8 +21,8 @@ MATHPILE_META="/local00/student/shakya/mathpile_meta.jsonl"
 EXAMPLE_PATH="data/openmathinstruct2/example_id_to_data.json"
 CHUNK_PATH="/local00/student/shakya/chunk_texts.json"
 
-MODES=("raw" "summary")
-# MODES=("summary")
+MODES=("summary")
+# MODES=("raw" "summary")
 
 # Default k_final (used for summary)
 K_FINAL=5
