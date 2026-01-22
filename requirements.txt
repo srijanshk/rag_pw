@@ -113,6 +113,6 @@ unicodedata2 @ file:///croot/unicodedata2_1736541023050/work
 urllib3 @ file:///croot/urllib3_1737133630106/work
 wandb==0.19.10
 wget==3.2
-wheel==0.45.1
+wheel==0.46.2
 xxhash @ file:///croot/python-xxhash_1737039434400/work
 yarl @ file:///croot/yarl_1732546845924/work
