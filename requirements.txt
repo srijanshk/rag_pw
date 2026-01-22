@@ -61,7 +61,7 @@ pandas @ file:///croot/pandas_1732735089971/work/dist/pandas-2.2.3-cp312-cp312-l
 pillow @ file:///croot/pillow_1738010226202/work
 platformdirs==4.3.7
 propcache @ file:///croot/propcache_1732303986938/work
-protobuf==6.30.2
+protobuf==6.31.1
 psutil==7.0.0
 pyarrow @ file:///croot/pyarrow_1738229418212/work/python
 pydantic==2.11.4
