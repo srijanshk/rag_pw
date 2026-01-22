@@ -104,7 +104,7 @@ torch==2.8.0
 torchvision==0.20.1+cu121
 tornado @ file:///croot/tornado_1733960490606/work
 tqdm @ file:///croot/tqdm_1738943501192/work
-transformers==4.50.3
+transformers==4.53.0
 triton==3.1.0
 typing-inspection==0.4.0
 typing_extensions @ file:///croot/typing_extensions_1734714854207/work
