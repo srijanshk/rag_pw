@@ -100,7 +100,7 @@ sphinxcontrib-serializinghtml==2.0.0
 sympy==1.13.1
 threadpoolctl==3.6.0
 tokenizers==0.21.1
-torch==2.5.1+cu121
+torch==2.8.0
 torchvision==0.20.1+cu121
 tornado @ file:///croot/tornado_1733960490606/work
 tqdm @ file:///croot/tqdm_1738943501192/work
