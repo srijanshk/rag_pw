@@ -29,6 +29,8 @@ rag_train_final_v3/*
 rag_train_hybrid_v3/*
 rag_train_hybrid_v4/*
 
+CLAUDE.md
+.claude/
 
 # Other temporary files
 *.log
