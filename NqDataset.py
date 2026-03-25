@@ -4,13 +4,14 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerFast # For type hinting, or AutoTokenizer
 
 class NQDataset(Dataset):
-    def __init__(self, 
+    def __init__(self,
                  data_list: List[Dict[str, Any]],
                  sparse_retrieval_data: Dict[str, List[Dict[str, Any]]], # Pre computed sparse retrieval data
                  question_tokenizer: PreTrainedTokenizerFast,
                  generator_tokenizer: PreTrainedTokenizerFast,
-                 max_question_length: int, 
-                 max_answer_length: int):
+                 max_question_length: int,
+                 max_answer_length: int,
+                 encoder_prefix: str = ""):
         """
         Args:
             data_list: A list of dictionary objects, where each dict is an NQ entry.
@@ -25,6 +26,7 @@ class NQDataset(Dataset):
         self.generator_tokenizer = generator_tokenizer
         self.max_question_length = max_question_length
         self.max_answer_length = max_answer_length
+        self.encoder_prefix = encoder_prefix
         print(f"NQDataset initialized with {len(self.dataset_entries)} entries.")
 
     def __len__(self):
@@ -53,9 +55,9 @@ class NQDataset(Dataset):
             # print(f"Warning: Missing question for entry at index {idx}. Using empty string.")
             pass # Tokenizer will handle empty string
 
-        # Tokenize question for the E5 question encoder
+        # Tokenize question for the E5 question encoder (apply model-specific prefix, e.g. "query: " for E5)
         question_tokenized = self.question_tokenizer(
-            original_question_str,
+            self.encoder_prefix + original_question_str,
             max_length=self.max_question_length,
             padding="max_length", # Pad to max_length
             truncation=True,

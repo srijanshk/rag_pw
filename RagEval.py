@@ -101,22 +101,27 @@ def evaluate_dense_rag_model(
             batch_generator_attention_mask = generator_inputs["generator_attention_mask"]
 
             # 4. Generate an answer candidate for each (question, retrieved_doc) context
-            candidate_generated_ids = generator_model.generate(
+            gen_output = generator_model.generate(
                 input_ids=batch_generator_input_ids,
                 attention_mask=batch_generator_attention_mask,
                 num_beams=4, max_length=max_answer_length + 20, early_stopping=True,
                 pad_token_id=generator_tokenizer.eos_token_id if generator_tokenizer.eos_token_id is not None else generator_tokenizer.pad_token_id,
                 eos_token_id=generator_tokenizer.eos_token_id,
-                decoder_start_token_id=generator_model.config.decoder_start_token_id
+                decoder_start_token_id=generator_model.config.decoder_start_token_id,
+                return_dict_in_generate=True,
+                output_scores=True,
             )
-            candidate_generated_ids = candidate_generated_ids.view(
+            candidate_generated_ids = gen_output.sequences.view(
                 len(original_question_strings), k_retrieved, -1
             )
+            # gen_output.sequences_scores: log P(y|q, doc_i) for each candidate [batch_size * k_retrieved]
+            gen_log_probs = gen_output.sequences_scores.view(len(original_question_strings), k_retrieved)
 
-            # 5. Select the best answer for each original question using doc scores
+            # 5. Select best answer: argmax over log P(doc|q) + log P(y|q, doc)  (RAG-Sequence decoding)
             expanded_query_embeddings = current_query_embeddings.unsqueeze(1)
             doc_scores = torch.bmm(expanded_query_embeddings, batch_retrieved_doc_embeddings.transpose(1, 2)).squeeze(1)
-            best_doc_indices = torch.argmax(doc_scores, dim=1)
+            doc_log_probs = F.log_softmax(doc_scores, dim=-1)
+            best_doc_indices = torch.argmax(doc_log_probs + gen_log_probs.to(doc_log_probs.device), dim=1)
 
             final_predictions_for_batch = []
             for i in range(len(original_question_strings)):
@@ -124,7 +129,7 @@ def evaluate_dense_rag_model(
                 selected_generated_ids = candidate_generated_ids[i, best_doc_idx, :]
                 decoded_text = generator_tokenizer.decode(selected_generated_ids, skip_special_tokens=True)
                 final_predictions_for_batch.append(decoded_text)
-            
+
             all_final_predictions.extend(final_predictions_for_batch)
             all_reference_answers.extend(current_reference_answers)
 
@@ -135,7 +140,7 @@ def evaluate_dense_rag_model(
                         best_doc_idx_for_log = best_doc_indices[i].item()
                         titles_to_log = batch_retrieved_doc_titles[i]
                         texts_to_log = batch_retrieved_doc_texts[i]
-                        
+
                         sample = {
                             "epoch": epoch_num_for_log,
                             "question": original_question_strings[i],
@@ -148,7 +153,7 @@ def evaluate_dense_rag_model(
                         logged_qa_retrieval_samples_eval.append(sample)
                         logged_examples_count += 1
                     else: break
-        
+
     metrics = {}
     if all_reference_answers and all_final_predictions:
         if len(all_final_predictions) == len(all_reference_answers):
@@ -239,22 +244,27 @@ def evaluate_custom_rag_model(
             batch_generator_attention_mask = generator_inputs["generator_attention_mask"]
 
             # 4. Generate an answer candidate for each (question, retrieved_doc) context
-            candidate_generated_ids = generator_model.generate(
+            gen_output = generator_model.generate(
                 input_ids=batch_generator_input_ids,
                 attention_mask=batch_generator_attention_mask,
                 num_beams=4, max_length=max_answer_length + 20, early_stopping=True,
                 pad_token_id=generator_tokenizer.eos_token_id if generator_tokenizer.eos_token_id is not None else generator_tokenizer.pad_token_id,
                 eos_token_id=generator_tokenizer.eos_token_id,
-                decoder_start_token_id=generator_model.config.decoder_start_token_id
+                decoder_start_token_id=generator_model.config.decoder_start_token_id,
+                return_dict_in_generate=True,
+                output_scores=True,
             )
-            candidate_generated_ids = candidate_generated_ids.view(
+            candidate_generated_ids = gen_output.sequences.view(
                 len(original_question_strings), k_retrieved, -1
             )
+            # gen_output.sequences_scores: log P(y|q, doc_i) for each candidate [batch_size * k_retrieved]
+            gen_log_probs = gen_output.sequences_scores.view(len(original_question_strings), k_retrieved)
 
-            # 5. Select the best answer for each original question using doc scores
+            # 5. Select best answer: argmax over log P(doc|q) + log P(y|q, doc)  (RAG-Sequence decoding)
             expanded_query_embeddings = current_query_embeddings.unsqueeze(1)
             doc_scores = torch.bmm(expanded_query_embeddings, batch_retrieved_doc_embeddings.transpose(1, 2)).squeeze(1)
-            best_doc_indices = torch.argmax(doc_scores, dim=1)
+            doc_log_probs = F.log_softmax(doc_scores, dim=-1)
+            best_doc_indices = torch.argmax(doc_log_probs + gen_log_probs.to(doc_log_probs.device), dim=1)
 
             final_predictions_for_batch = []
             for i in range(len(original_question_strings)):
@@ -262,7 +272,7 @@ def evaluate_custom_rag_model(
                 selected_generated_ids = candidate_generated_ids[i, best_doc_idx, :]
                 decoded_text = generator_tokenizer.decode(selected_generated_ids, skip_special_tokens=True)
                 final_predictions_for_batch.append(decoded_text)
-            
+
             all_final_predictions.extend(final_predictions_for_batch)
             all_reference_answers.extend(current_reference_answers)
 
@@ -273,7 +283,7 @@ def evaluate_custom_rag_model(
                         best_doc_idx_for_log = best_doc_indices[i].item()
                         titles_to_log = batch_retrieved_doc_titles[i]
                         texts_to_log = batch_retrieved_doc_texts[i]
-                        
+
                         sample = {
                             "epoch": epoch_num_for_log,
                             "question": original_question_strings[i],
@@ -286,7 +296,7 @@ def evaluate_custom_rag_model(
                         logged_qa_retrieval_samples_eval.append(sample)
                         logged_examples_count += 1
                     else: break
-        
+
     metrics = {}
     if all_reference_answers and all_final_predictions:
         if len(all_final_predictions) == len(all_reference_answers):

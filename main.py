@@ -112,8 +112,8 @@ def main():
 
     if not train_data_list: print("Training data list is empty. Exiting."); return
         
-    train_dataset = NQDataset(train_data_list, train_sparse_data_lookup, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
-    eval_dataset = NQDataset(eval_data_list, eval_sparse_data_lookup, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH)
+    train_dataset = NQDataset(train_data_list, train_sparse_data_lookup, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH, encoder_prefix="query: ")
+    eval_dataset = NQDataset(eval_data_list, eval_sparse_data_lookup, e5_tokenizer, bart_tokenizer, MAX_QUESTION_LENGTH, MAX_ANSWER_LENGTH, encoder_prefix="query: ")
     
     train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn)
     eval_dataloader = DataLoader(eval_dataset, batch_size=EVAL_BATCH_SIZE, collate_fn=custom_collate_fn if eval_data_list else None)

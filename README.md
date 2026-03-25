@@ -1,111 +1,169 @@
-### Retrieval Augmented Generation
+# Retrieval-Augmented Generation (RAG) — Practical Work
 
-## Getting Started
+Reimplementation of [Lewis et al., 2020 — *Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks*](https://arxiv.org/abs/2005.11401) for open-domain QA on the Natural Questions (NQ) dataset.
 
-Follow the detailed instructions in the sections below to set up the project and execute the workflow. Ensure all prerequisites are met before proceeding with the installation and data processing steps.
+The implementation extends the original paper with:
+- **E5-large-v2** as the retriever backbone (replacing DPR)
+- **FAISS HNSW** index for scalable approximate nearest-neighbor search (replacing flat exact search)
+- **Hybrid retrieval**: dense (E5) + sparse (BM25 via Xapian) fused with Reciprocal Rank Fusion (RRF)
 
+---
 
-## Folder Structure
-```bash
-rag_pw
-├── README.md
-├── utils
-│   ├── download_data.py
-├── misc
-├── main.py #Main File to Execute
-├── NqDataset.py  
-├── QuestionEncoder.py 
-├── DenseRetriever.py 
-├── RagUtils.py 
-├── RagEval.py 
-├── xapian_retriever.py 
-├── document_vector_index.py 
-├── generate_xapian_index.py 
-└── utils.py
+## Pipeline
+
 ```
-## Quick Installation Guide
+Question → [E5 Query Encoder] + [BM25/Xapian]
+                ↓                     ↓
+         FAISS HNSW Search     Xapian Sparse Search
+                ↓                     ↓
+           Dense Docs           Sparse Docs
+                └──── RRF Hybrid Merge ────┘
+                              ↓
+                  [BART-large Generator] → Answer
+```
 
-1. **Install Prerequisites**
-   - Ensure **Anaconda** or **Miniconda** is installed. Download from [Anaconda's official website](https://www.anaconda.com/products/distribution).
+---
 
-2. **Clone the Repository**
-   ```bash
-   git clone https://github.com/srijanshk/rag_pw.git
-   cd RAG_PW
-   ```
+## Quick Start
 
-3. **Install Xapian(Optional but recommended)**
-   1. **Update the Package List**
-      ```sh
-      sudo apt update
-      ```
+### 1. Install prerequisites
 
-   2. **Install Xapian Core**
-      ```sh
-      sudo apt install xapian-tools libxapian-dev
-      ```
+```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-   3. **Verify Installation**
-      ```sh
-      xapian-config --version
-      ```
+# Sync dependencies
+uv sync
+source .venv/bin/activate
+```
 
-   4. **Optional: Install Python Bindings**
-      If you need Python bindings for Xapian:
-      ```sh
-      sudo apt install python3-xapian
-      ```
+### 2. Install Xapian (optional, for sparse/hybrid retrieval)
 
-   5. **Test Installation**
-      Try importing Xapian in Python:
-      ```python
-      import xapian
-      print(xapian.version_string())
-      ```
+```bash
+sudo apt update
+sudo apt install xapian-tools libxapian-dev python3-xapian
+# Verify:
+xapian-config --version
+python3 -c "import xapian; print(xapian.version_string())"
+```
 
-      If the version is printed, the installation was successful.
+### 3. Clone the repository
 
+```bash
+git clone https://github.com/srijanshk/rag_pw.git
+cd RAG_PW
+uv sync
+source .venv/bin/activate
+```
 
-4. **Create the Environment**
-   ```bash
-   conda env create -f environment.yml
-   ```
+---
 
-5. **Activate the Environment**
-   ```bash
-   conda activate srijan_pw_env
-   ```
+## Data Download
 
-6. **Deactivate Environment (When Done)**
-   ```bash
-   conda deactivate
-   ```
+Follow the [DPR repository](https://github.com/facebookresearch/DPR) to download NQ data and the Wikipedia dump.
 
-### Download data
+```bash
+# QA pairs
+python utils/download_data.py --resource data.retriever.qas
+python utils/download_data.py --resource data.retriever.nq
 
-Follow [DPR repo](https://github.com/facebookresearch/DPR.git) in order to download NQ data and Wikipedia DB. 
+# Wikipedia dump
+python utils/download_data.py --resource data.wikipedia_split
 
-1. Download QA pairs by `python utils/download_data.py --resource data.retriever.qas` and `python3 data/download_data.py --resource data.retriever.nq`.
-2. Download wikipedia DB by `python utils/download_data.py --resource data.wikipedia_split`.
-3. Download gold question-passage pairs by `python utils/download_data.py --resource data.gold_passages_info`.
+# Gold question-passage pairs
+python utils/download_data.py --resource data.gold_passages_info
+```
 
-#### Fine Tune Retriever and Generator
+---
+
+## Workflow
+
+### Step 1 — Fine-tune retriever and generator independently (optional warm-start)
 
 ```bash
 python misc/train_retriever.py
 python misc/train_generator.py
 ```
-#### Generate Vector Index (FAISS)
+
+### Step 2 — Build the FAISS HNSW index from Wikipedia
 
 ```bash
 python document_vector_index.py
 ```
-#### Generate Xapian Index
+
+### Step 3 — Build the Xapian (BM25) index from Wikipedia
+
 ```bash
 python generate_xapian_index.py
 ```
 
-#### Run End-to-End Training
+### Step 4 — Pre-compute sparse retrieval results
+
+```bash
+python misc/sparse_retrieve_contexts.py
+```
+
+### Step 5 — Run end-to-end RAG training
+
 ```bash
 python main.py
 ```
+
+### Evaluation only
+
+```bash
+python run_eval.py
+```
+
+### Tests
+
+```bash
+python test_function.py
+python bootstrap_testing.py
+```
+
+---
+
+## Repository Structure
+
+```
+RAG_PW/
+├── main.py                      # Training entry point; all hyperparameters set here
+├── run_eval.py                  # Evaluation-only entry point
+├── QuestionEncoder.py           # E5 wrapper with mean pooling (PreTrainedModel subclass)
+├── DenseRetriever.py            # FAISS HNSW index wrapper + document encoder
+├── RagUtils.py                  # Retrieval, hybrid merge, generator input prep, RAG loss
+├── RagEval.py                   # Evaluation with EM/F1; RAG-Sequence decoding
+├── NqDataset.py                 # PyTorch Dataset for NQ; tokenizes questions and answers
+├── xapian_retriever.py          # Xapian BM25/TF-IDF wrapper
+├── document_vector_index.py     # Builds FAISS HNSW index from Wikipedia passages
+├── generate_xapian_index.py     # Builds Xapian sparse index from Wikipedia passages
+├── utils.py                     # Data loading, custom collate function
+├── utils/
+│   └── download_data.py         # DPR-style data downloader
+├── misc/
+│   ├── train_retriever.py       # Stand-alone retriever fine-tuning
+│   ├── train_generator.py       # Stand-alone generator fine-tuning
+│   └── sparse_retrieve_contexts.py  # Pre-computes sparse retrieval JSONL files
+├── pyproject.toml               # uv/pip dependency spec
+└── uv.lock                      # Locked dependency versions
+```
+
+---
+
+## Monitoring
+
+Training uses [Weights & Biases](https://wandb.ai) for loss and eval metric logging. Run `wandb login` before starting, or set `WANDB_MODE=disabled` to skip it.
+
+---
+
+## Key Design Decisions vs. Original Paper
+
+| Aspect | Lewis et al. (2020) | This Implementation |
+|---|---|---|
+| Retriever | DPR (BERT bi-encoder) | E5-large-v2 |
+| Retrieval index | FAISS flat (exact MIPS) | FAISS HNSW (approximate) |
+| Retrieval strategy | Dense only | Dense + BM25 hybrid (RRF) |
+| Training | Query encoder + BART jointly; doc encoder frozen | Same |
+| Loss | RAG-Sequence marginal NLL | Same |
+| Evaluation decoding | RAG-Sequence: per-doc generation + marginalization | Same (`log P(doc|q) + log P(y|q,doc)`) |
